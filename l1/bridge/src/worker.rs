@@ -70,6 +70,9 @@ pub(crate) struct BridgeWorker {
     /// On a fresh chain, seed the root this many chain-blocks below the sink instead of the
     /// pruning point. `None` seeds from the pruning point.
     seed_depth: Option<u64>,
+    /// On a fresh chain, seed the root at this explicit block instead of the sink or the pruning
+    /// point. Takes precedence over `seed_depth`. `None` defers to `seed_depth`/pruning point.
+    start_from: Option<Hash>,
     /// Optional observer the latest chain-block DAA score is published to, for external progress
     /// reporting during catch-up.
     tip_daa: Option<Arc<AtomicU64>>,
@@ -154,6 +157,7 @@ impl BridgeWorker {
             finality_depth: config.finality_depth,
             covenant_id: config.covenant_id,
             seed_depth: config.seed_depth,
+            start_from: config.start_from,
             tip_daa: config.tip_daa.clone(),
         }
         .run()
@@ -248,9 +252,10 @@ impl BridgeWorker {
         let init_result = if let Some(target) = self.backfill_target.take() {
             self.backfill_chain(&target).await
         } else if self.virtual_chain.tip().index() == 0 {
-            match self.seed_depth {
-                Some(depth) => self.seed_from_recent(depth).await,
-                None => self.seed_from_pruning_point().await,
+            match (self.start_from, self.seed_depth) {
+                (Some(hash), _) => self.seed_from_block(hash).await,
+                (None, Some(depth)) => self.seed_from_recent(depth).await,
+                (None, None) => self.seed_from_pruning_point().await,
             }
         } else {
             Ok(())
@@ -321,6 +326,20 @@ impl BridgeWorker {
         let root = self.client.get_block(hash, false).await?;
         self.virtual_chain = VirtualChain::new(Checkpoint::new(0, (&root.header).into()));
         log::info!("L1 bridge: seeding {depth} blocks below sink {sink} (root {hash})");
+
+        Ok(())
+    }
+
+    /// Seeds the virtual chain at an explicit block, installing it as the root/tip at index 0 so
+    /// the first emitted block lands at index 1. Used to start replay at a known historical
+    /// block (a covenant's deploy block) so a catch-up node rebuilds state forward from there.
+    /// The block must be at or before the covenant bootstrap, or the bridge misses the
+    /// bootstrap's settlements; a reorg below it panics in `rollback`, same as
+    /// `seed_from_recent`.
+    async fn seed_from_block(&mut self, hash: Hash) -> Result<()> {
+        let block = self.client.get_block(hash, false).await?;
+        self.virtual_chain = VirtualChain::new(Checkpoint::new(0, (&block.header).into()));
+        log::info!("L1 bridge: seeding from explicit block {hash}");
 
         Ok(())
     }

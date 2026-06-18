@@ -37,6 +37,11 @@ pub struct L1BridgeConfig {
     /// instead of from the pruning point, so the bridge starts near the tip. `None` seeds from the
     /// pruning point.
     pub seed_depth: Option<u64>,
+    /// On a fresh chain (no `root`/`tip`), the explicit block to seed the root at, instead of the
+    /// sink or the pruning point: a known historical block (a covenant's deploy block) a catch-up
+    /// node rebuilds state forward from. Fresh-chain precedence: `start_from` > `seed_depth` >
+    /// pruning point. `None` defers to the lower-precedence options.
+    pub start_from: Option<Hash>,
     /// Optional observer the bridge stores its latest chain-block DAA score into. Lets an external
     /// progress reporter gauge how far the chain has replayed toward the node's virtual tip
     /// without polling the bridge directly. `None` disables publishing.
@@ -58,6 +63,7 @@ impl Default for L1BridgeConfig {
             finality_depth: Params::from(NetworkId::new(NetworkType::Mainnet)).finality_depth(),
             covenant_id: None,
             seed_depth: None, // Replay from the pruning point by default.
+            start_from: None, // No explicit seed block; defer to seed_depth/pruning point.
             tip_daa: None,
         }
     }
@@ -136,6 +142,14 @@ impl L1BridgeConfig {
     /// pruning point. `None` seeds from the pruning point.
     pub fn with_seed_depth(mut self, seed_depth: Option<u64>) -> Self {
         self.seed_depth = seed_depth;
+        self
+    }
+
+    /// On a fresh chain, seed the root at this explicit block instead of from the sink or the
+    /// pruning point. `None` defers to `seed_depth`/pruning point. Precedence on a fresh chain:
+    /// `start_from` > `seed_depth` > pruning point.
+    pub fn with_start_from(mut self, start_from: Option<Hash>) -> Self {
+        self.start_from = start_from;
         self
     }
 
