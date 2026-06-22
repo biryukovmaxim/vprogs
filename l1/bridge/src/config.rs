@@ -3,9 +3,12 @@ use std::{
     time::Duration,
 };
 
+use arc_swap::ArcSwapOption;
 use kaspa_consensus_core::{config::params::Params, subnets::SubnetworkId};
 use vprogs_core_types::Checkpoint;
-use vprogs_l1_types::{ChainBlockMetadata, ConnectStrategy, Hash, NetworkId, NetworkType};
+use vprogs_l1_types::{
+    ChainBlockMetadata, ConnectStrategy, Hash, NetworkId, NetworkType, SettlementInfo,
+};
 
 /// Configuration for the L1 bridge.
 #[derive(Clone, Debug)]
@@ -46,6 +49,10 @@ pub struct L1BridgeConfig {
     /// progress reporter gauge how far the chain has replayed toward the node's virtual tip
     /// without polling the bridge directly. `None` disables publishing.
     pub tip_daa: Option<Arc<AtomicU64>>,
+    /// Optional live handle the bridge publishes the tip's last covenant settlement into. The
+    /// bridge is the single writer; the settler reads it to decide settle/skip against the
+    /// canonical settlement without a confirm RTT. `None` disables publishing.
+    pub settlement: Option<Arc<ArcSwapOption<SettlementInfo>>>,
 }
 
 impl Default for L1BridgeConfig {
@@ -65,6 +72,7 @@ impl Default for L1BridgeConfig {
             seed_depth: None, // Replay from the pruning point by default.
             start_from: None, // No explicit seed block; defer to seed_depth/pruning point.
             tip_daa: None,
+            settlement: None,
         }
     }
 }
@@ -157,6 +165,16 @@ impl L1BridgeConfig {
     /// disables publishing.
     pub fn with_tip_daa_observer(mut self, tip_daa: Option<Arc<AtomicU64>>) -> Self {
         self.tip_daa = tip_daa;
+        self
+    }
+
+    /// Sets the live handle the bridge publishes the tip's last covenant settlement into. `None`
+    /// disables publishing.
+    pub fn with_settlement_observer(
+        mut self,
+        settlement: Option<Arc<ArcSwapOption<SettlementInfo>>>,
+    ) -> Self {
+        self.settlement = settlement;
         self
     }
 }

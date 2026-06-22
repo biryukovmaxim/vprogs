@@ -6,6 +6,7 @@ use std::{
     time::Duration,
 };
 
+use arc_swap::ArcSwapOption;
 use crossbeam_queue::SegQueue;
 use futures::{FutureExt, select_biased};
 use kaspa_consensus_core::subnets::SubnetworkId;
@@ -25,7 +26,9 @@ use kaspa_seq_commit::{
 use kaspa_wrpc_client::prelude::*;
 use tokio::sync::Notify;
 use vprogs_core_types::Checkpoint;
-use vprogs_l1_types::{ChainBlockMetadata, Hash, L1Transaction, L1TransactionCovenantExt};
+use vprogs_l1_types::{
+    ChainBlockMetadata, Hash, L1Transaction, L1TransactionCovenantExt, SettlementInfo,
+};
 use workflow_core::channel::{Channel, MultiplexerChannel};
 
 use crate::{
@@ -76,6 +79,9 @@ pub(crate) struct BridgeWorker {
     /// Optional observer the latest chain-block DAA score is published to, for external progress
     /// reporting during catch-up.
     tip_daa: Option<Arc<AtomicU64>>,
+    /// Optional live handle the tip's last covenant settlement is published to (the bridge is the
+    /// single writer), so the settler can read the canonical settlement without a confirm RTT.
+    settlement: Option<Arc<ArcSwapOption<SettlementInfo>>>,
 }
 
 impl BridgeWorker {
@@ -159,6 +165,7 @@ impl BridgeWorker {
             seed_depth: config.seed_depth,
             start_from: config.start_from,
             tip_daa: config.tip_daa.clone(),
+            settlement: config.settlement.clone(),
         }
         .run()
         .await;
@@ -268,6 +275,7 @@ impl BridgeWorker {
         // Step 3: Notify consumer and sync to current chain state. Publish the seeded tip first, so
         // a progress reporter has a baseline before the first (potentially large) batch lands.
         self.publish_tip_daa();
+        self.publish_settlement();
         self.push_event(L1Event::Connected);
         let result = self.fetch_chain_updates().await;
         self.handle_sync_result(result);
@@ -278,6 +286,15 @@ impl BridgeWorker {
     fn publish_tip_daa(&self) {
         if let Some(observer) = &self.tip_daa {
             observer.store(self.virtual_chain.tip().metadata().daa_score, Ordering::Relaxed);
+        }
+    }
+
+    /// Publishes the tip's last covenant settlement to the optional live handle, so the settler
+    /// reads the canonical settlement. Stores `None` when the tip carries no settlement yet or a
+    /// reorg has rolled past the last one.
+    fn publish_settlement(&self) {
+        if let Some(observer) = &self.settlement {
+            observer.store(self.virtual_chain.tip().metadata().last_settlement.map(Arc::new));
         }
     }
 
@@ -451,6 +468,7 @@ impl BridgeWorker {
             let header = &chain_block.chain_block_header;
             let parent_meta = *self.virtual_chain.tip().metadata();
             let block_hash = header.hash.expect("missing hash");
+            let block_daa = header.daa_score.expect("missing daa_score");
             let mut last_settlement = parent_meta.last_settlement;
 
             // Enumerate before filtering so kept txs retain their block-wide positions.
@@ -461,7 +479,8 @@ impl BridgeWorker {
                 .filter_map(|(idx, tx)| {
                     let tx = L1Transaction::try_from(tx.clone()).expect("missing tx fields");
                     if let Some(id) = self.covenant_id {
-                        last_settlement = tx.settlement_info(id, block_hash).or(last_settlement);
+                        last_settlement =
+                            tx.settlement_info(id, block_hash, block_daa).or(last_settlement);
                     }
                     match self.subnetwork_filter.as_ref() {
                         Some(want) if tx.subnetwork_id != *want => None,
@@ -495,6 +514,7 @@ impl BridgeWorker {
 
         // Publish the batch's new tip so the progress reporter advances as catch-up proceeds.
         self.publish_tip_daa();
+        self.publish_settlement();
 
         Ok(())
     }
