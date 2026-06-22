@@ -38,6 +38,13 @@ use crate::{
     virtual_chain::VirtualChain,
 };
 
+/// Bounded retries for the virtual-chain RPC before surfacing the error. A real testnet node times
+/// out transiently, so the bridge must ride out a blip rather than fatal on the first one. Sized to
+/// cover a short node hiccup without wedging the worker indefinitely on a genuinely dead node.
+const RPC_RETRY_MAX_ATTEMPTS: u32 = 10;
+/// Delay between virtual-chain RPC retries.
+const RPC_RETRY_DELAY: Duration = Duration::from_millis(500);
+
 /// Runs inside a dedicated thread and communicates with the L1 node over RPC. Pushes [`L1Event`]s
 /// to a shared queue for the [`L1Bridge`] consumer.
 pub(crate) struct BridgeWorker {
@@ -391,6 +398,46 @@ impl BridgeWorker {
         Ok(())
     }
 
+    /// Fetches the virtual chain from `from` with Full verbosity, retrying transient RPC failures
+    /// with a bounded backoff. A real testnet node times out transiently; without this the chain
+    /// init backfill (and steady-state follow) would fatal the whole worker on a single blip.
+    ///
+    /// Only transient `Error::Rpc` failures are retried. Terminal errors (`CheckpointLost`,
+    /// `BackfillTargetNotFound`, and the rest) are returned immediately so a genuine reorg/prune
+    /// past the root still fatals. The backoff sleep is interruptible by the worker's shutdown
+    /// signal, so shutdown during a backfill is honored within one `RPC_RETRY_DELAY`.
+    async fn get_vcc_with_retry(
+        &self,
+        from: Hash,
+        threshold: Option<u64>,
+    ) -> Result<GetVirtualChainFromBlockV2Response> {
+        for attempt in 1..=RPC_RETRY_MAX_ATTEMPTS {
+            match self
+                .client
+                .get_virtual_chain_from_block_v2(from, Some(Full), threshold)
+                .await
+                .map_err(Error::from)
+            {
+                Ok(response) => return Ok(response),
+                Err(e) if e.is_fatal() || attempt == RPC_RETRY_MAX_ATTEMPTS => return Err(e),
+                Err(e) => {
+                    log::warn!(
+                        "L1 bridge: get_virtual_chain_from_block_v2 failed \
+                         (attempt {attempt}/{RPC_RETRY_MAX_ATTEMPTS}, retrying): {e}"
+                    );
+                    // Sleep, but let shutdown cut the backoff short.
+                    select_biased! {
+                        _ = self.shutdown.notified().fuse() => {
+                            return Err(Error::ChannelClosed("shutdown during RPC retry".into()));
+                        }
+                        _ = tokio::time::sleep(RPC_RETRY_DELAY).fuse() => {}
+                    }
+                }
+            }
+        }
+        unreachable!("retry loop returns on the final attempt")
+    }
+
     /// Backfills the chain between root and `target`. Only runs once on first connect when resuming
     /// with a saved root/tip pair.
     async fn backfill_chain(&mut self, target: &Checkpoint<ChainBlockMetadata>) -> Result<()> {
@@ -404,14 +451,8 @@ impl BridgeWorker {
         let target_hash = target.metadata().hash;
         loop {
             // Fetch with Full verbosity so backfilled entries carry complete header fields.
-            let response = self
-                .client
-                .get_virtual_chain_from_block_v2(
-                    self.virtual_chain.tip().metadata().hash,
-                    Some(Full),
-                    None,
-                )
-                .await?;
+            let response =
+                self.get_vcc_with_retry(self.virtual_chain.tip().metadata().hash, None).await?;
 
             // An empty batch means the server has nothing more to return - target is unreachable.
             if response.chain_block_accepted_transactions.is_empty() {
@@ -440,15 +481,12 @@ impl BridgeWorker {
     /// Fetches chain updates from the current tip. Handles reorgs and emits `ChainBlockAdded`
     /// events. Assumes the virtual chain has been initialized by `handle_connected`.
     async fn fetch_chain_updates(&mut self) -> Result<()> {
-        // Fetch with Full verbosity to get complete headers and accepted transactions.
-        let response = self
-            .client
-            .get_virtual_chain_from_block_v2(
-                self.virtual_chain.tip().metadata().hash,
-                Some(Full),
-                self.reorg_filter.threshold(),
-            )
-            .await?;
+        // Fetch with Full verbosity to get complete headers and accepted transactions. Resolve the
+        // tip and the (mutably-computed) reorg threshold first so the shared borrow taken by the
+        // retry helper doesn't overlap them.
+        let from = self.virtual_chain.tip().metadata().hash;
+        let threshold = self.reorg_filter.threshold();
+        let response = self.get_vcc_with_retry(from, threshold).await?;
 
         // Removed hashes indicate a reorg - roll back before processing additions.
         if !response.removed_chain_block_hashes.is_empty() {
