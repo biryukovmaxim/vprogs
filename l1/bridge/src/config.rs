@@ -3,8 +3,8 @@ use std::{
     time::Duration,
 };
 
-use arc_swap::ArcSwapOption;
 use kaspa_consensus_core::{config::params::Params, subnets::SubnetworkId};
+use tokio::sync::watch;
 use vprogs_core_types::Checkpoint;
 use vprogs_l1_types::{
     ChainBlockMetadata, ConnectStrategy, Hash, NetworkId, NetworkType, SettlementInfo,
@@ -49,10 +49,11 @@ pub struct L1BridgeConfig {
     /// progress reporter gauge how far the chain has replayed toward the node's virtual tip
     /// without polling the bridge directly. `None` disables publishing.
     pub tip_daa: Option<Arc<AtomicU64>>,
-    /// Optional live handle the bridge publishes the tip's last covenant settlement into. The
-    /// bridge is the single writer; the settler reads it to decide settle/skip against the
-    /// canonical settlement without a confirm RTT. `None` disables publishing.
-    pub settlement: Option<Arc<ArcSwapOption<SettlementInfo>>>,
+    /// Optional `watch` sender the bridge publishes the tip's last covenant settlement into. The
+    /// bridge is the single writer; each settler holds a [`watch::Receiver`] it borrows (and, once
+    /// confirmation is notification-based, awaits) to reconcile against the canonical settlement
+    /// without a confirm RTT. `None` disables publishing.
+    pub settlement: Option<watch::Sender<Option<SettlementInfo>>>,
 }
 
 impl Default for L1BridgeConfig {
@@ -168,11 +169,11 @@ impl L1BridgeConfig {
         self
     }
 
-    /// Sets the live handle the bridge publishes the tip's last covenant settlement into. `None`
+    /// Sets the `watch` sender the bridge publishes the tip's last covenant settlement into. `None`
     /// disables publishing.
     pub fn with_settlement_observer(
         mut self,
-        settlement: Option<Arc<ArcSwapOption<SettlementInfo>>>,
+        settlement: Option<watch::Sender<Option<SettlementInfo>>>,
     ) -> Self {
         self.settlement = settlement;
         self
