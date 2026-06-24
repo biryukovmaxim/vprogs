@@ -224,6 +224,7 @@ fn build_exec(
                 covenant_id,
                 lane_source: ConsensusLaneSource::from_weak(consensus),
                 settlement_queue: Some(queue.clone()),
+                settlement: None,
                 bundle_size: 1..=usize::MAX,
             },
         );
