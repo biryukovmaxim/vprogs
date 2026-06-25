@@ -29,7 +29,9 @@ use vprogs_scheduling_scheduler::{Processor, Scheduler};
 use vprogs_storage_rocksdb_store::RocksDbStore;
 use vprogs_zk_aggregate_prover::{AggregateProverConfig, ScheduledBundle, SettlementArtifact};
 use vprogs_zk_backend_risc0_api::{Backend, ProofType, Receipt};
-use vprogs_zk_backend_risc0_covenant::{Settlement, SettlementDevInput};
+use vprogs_zk_backend_risc0_covenant::{
+    DEFAULT_PERMISSION_OUTPUT_VALUE, Settlement, SettlementDevInput,
+};
 use vprogs_zk_backend_risc0_settler::{
     BuiltSettlement, CovenantState, FeeSource, FundedSettlement, SettlementMode, bootstrap_redeem,
     build_settlement_for_mode, dev_bootstrap_redeem,
@@ -615,6 +617,8 @@ impl L2Driver {
             claimed_seq_commit,
             prev_outpoint: cov.outpoint,
             value: cov.value,
+            permission_spk_hash: &[0u8; 32],
+            permission_output_value: DEFAULT_PERMISSION_OUTPUT_VALUE,
         });
         let continuation_spk = pay_to_script_hash_script(&settlement.next_redeem);
 
