@@ -73,10 +73,6 @@ impl<B: Backend, S: Store> Processor<S> for Vm<B, S> {
         *self.backend.batch_image_id()
     }
 
-    fn aggregator_image_id(&self) -> [u8; 32] {
-        *self.backend.aggregator_image_id()
-    }
-
     type Transaction = L1Transaction;
     type TransactionArtifact = B::Receipt;
     type BatchArtifact = B::Receipt;
