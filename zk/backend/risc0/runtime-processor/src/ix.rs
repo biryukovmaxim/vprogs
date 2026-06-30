@@ -91,8 +91,9 @@ pub enum ActionBody<'a> {
         source_idx: u8,
         dest_idx: u8,
         amount: u64,
-        /// Lock for the destination, present only to CREATE a new dest slot from this transfer (its
-        /// `id_hash()` derives the new user's address). `None` credits an existing destination.
+        /// Lock for the destination, present only to CREATE a new dest slot from this transfer
+        /// (its `id_hash()` derives the new user's address). `None` credits an existing
+        /// destination.
         dest_init: Option<LockEnum<'a>>,
     },
     UpdateUserLock {
