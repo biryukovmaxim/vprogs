@@ -50,6 +50,7 @@ kaspa-seq-commit     = { workspace = true }
 kaspa-wrpc-client    = { workspace = true }
 
 # external
+borsh      = { workspace = true }
 clap       = { workspace = true }
 ctrlc      = { workspace = true }
 fastrand   = { workspace = true }
