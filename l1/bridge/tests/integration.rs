@@ -445,7 +445,8 @@ fn shallow_pruning_params(p: &mut Params) {
             is the IBD-only PruningPointUtxoSetOverride notification"]
 async fn test_bridge_finalizes_on_steady_state_pruning_advance() {
     let node = L1Node::new(NetworkId::new(NetworkType::Simnet), Some(shallow_pruning_params)).await;
-    let genesis_pruning_hash = node.grpc_client().get_block_dag_info().await.unwrap().pruning_point_hash;
+    let genesis_pruning_hash =
+        node.grpc_client().get_block_dag_info().await.unwrap().pruning_point_hash;
 
     let sink = RecordingSink::new();
     let config = L1BridgeConfig::default()
