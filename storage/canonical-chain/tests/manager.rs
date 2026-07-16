@@ -83,6 +83,75 @@ fn restore_spans_buckets_and_reads_below_base_as_finalized() {
     assert!(is_canon(&manager, 100), "a bucket below the live floor reads as finalized-canonical");
 }
 
+/// Builds a live manager holding ids `1..=tip`, then finalizes below `base` so its live window is
+/// `base..=tip`: the same window a restore from persisted `base..=tip` entries produces.
+fn live_chain_finalized_to(base: u64, tip: u64) -> CanonicalChainManager<Meta> {
+    let mut manager = CanonicalChainManager::new(CanonicalChain::default(), []);
+    for id in 1..=tip {
+        manager.append(Meta { tag: id, parent: id - 1 });
+    }
+    manager.finalize(base);
+    manager
+}
+
+/// Restores a manager from persisted entries `base..=tip`, every id extending its predecessor.
+fn restored_chain(base: u64, tip: u64) -> CanonicalChainManager<Meta> {
+    let entries: Vec<(u64, Meta)> =
+        (base..=tip).map(|id| (id, Meta { tag: id, parent: id - 1 })).collect();
+    CanonicalChainManager::new(CanonicalChain::default(), entries)
+}
+
+#[test]
+#[ignore = "repro: restore zeroes the sub-base bits of the base bucket, so ids below `base` read \
+            orphaned there while a live chain at the same base reads them canonical"]
+fn restore_agrees_with_live_on_the_base_bucket_below_base() {
+    // A live chain and a restore share one window: base 5_000, tip 9_000, every id canonical.
+    // The contract is that an id below the finalization threshold reads canonical (`snapshot.rs`
+    // documents an absent, pruned bucket as canonical for every id in it). Id 4_999 sits below
+    // `base` but inside the base bucket (bucket 39 covers 4_993..=5_120), which restore
+    // materializes with only 5_000..=5_120 set, so the sub-base bits read `0` rather than absent.
+    let live = live_chain_finalized_to(5_000, 9_000);
+    let restored = restored_chain(5_000, 9_000);
+
+    assert_eq!(live.chain().tip(), restored.chain().tip(), "same window");
+    assert!(is_canon(&restored, 5_000), "the live floor itself is restored canonical");
+
+    // The below-base id in a bucket fully below the base bucket agrees; this is the case the
+    // existing coverage probes, and it works because the body ring has no bucket 0 to read.
+    assert_eq!(is_canon(&live, 100), is_canon(&restored, 100), "id 100, a fully below-base bucket");
+
+    // The base bucket itself does not agree.
+    assert_eq!(
+        is_canon(&restored, 4_999),
+        is_canon(&live, 4_999),
+        "id 4_999 is below base in the base bucket: live reads canonical, restore reads orphaned"
+    );
+}
+
+#[test]
+#[ignore = "repro: a single-bucket live range makes restore publish a fabricated all-zero \
+            `last_sealed` below `base`, which the hot-zone branch reads before the \
+            pruned-reads-canonical fallback"]
+fn restore_agrees_with_live_when_the_live_range_is_a_single_bucket() {
+    // Base 5_000 and tip 5_100 both land in bucket 39, so restore materializes exactly one bucket.
+    // Popping the tail off leaves nothing for `last_sealed`, which is then fabricated all-zero and
+    // published at bucket 38 (ids 4_865..=4_992) - below `base`, where no bucket should exist.
+    // `is_canonical` checks that hot-zone slot before reaching the fallback that would have
+    // returned canonical for a pruned bucket, so every id in bucket 38 reads orphaned.
+    let live = live_chain_finalized_to(5_000, 5_100);
+    let restored = restored_chain(5_000, 5_100);
+
+    assert_eq!(live.chain().tip(), restored.chain().tip(), "same window");
+    assert!(is_canon(&restored, 5_100), "the restored tip is canonical");
+
+    // Id 4_992 is the last id of bucket 38, the bucket the fabricated `last_sealed` occupies.
+    assert_eq!(
+        is_canon(&restored, 4_992),
+        is_canon(&live, 4_992),
+        "id 4_992 sits in the fabricated below-base bucket: live reads canonical, restore orphaned"
+    );
+}
+
 #[test]
 fn append_assigns_monotonic_ids_and_canonicalizes() {
     let mut manager = CanonicalChainManager::default();
