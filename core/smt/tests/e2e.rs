@@ -304,8 +304,6 @@ fn orphaned_version_is_skipped() {
 /// `tip == 0` the oracle is never consulted and the first version below `max_version` is served
 /// whatever its canonical bit says.
 #[test]
-#[ignore = "repro: `versions_tracked = snapshot.tip() > 0` short-circuits the `is_canonical` call, \
-            so a chain rolled back to genesis over a populated DB serves its orphaned versions"]
 fn rollback_to_genesis_still_hides_orphaned_versions() {
     let dir = TempDir::new().unwrap();
     let store = RocksDbStore::open(dir.path());

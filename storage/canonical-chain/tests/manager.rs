@@ -102,8 +102,6 @@ fn restored_chain(base: u64, tip: u64) -> CanonicalChainManager<Meta> {
 }
 
 #[test]
-#[ignore = "repro: restore zeroes the sub-base bits of the base bucket, so ids below `base` read \
-            orphaned there while a live chain at the same base reads them canonical"]
 fn restore_agrees_with_live_on_the_base_bucket_below_base() {
     // A live chain and a restore share one window: base 5_000, tip 9_000, every id canonical.
     // The contract is that an id below the finalization threshold reads canonical (`snapshot.rs`
@@ -129,9 +127,6 @@ fn restore_agrees_with_live_on_the_base_bucket_below_base() {
 }
 
 #[test]
-#[ignore = "repro: a single-bucket live range makes restore publish a fabricated all-zero \
-            `last_sealed` below `base`, which the hot-zone branch reads before the \
-            pruned-reads-canonical fallback"]
 fn restore_agrees_with_live_when_the_live_range_is_a_single_bucket() {
     // Base 5_000 and tip 5_100 both land in bucket 39, so restore materializes exactly one bucket.
     // Popping the tail off leaves nothing for `last_sealed`, which is then fabricated all-zero and
