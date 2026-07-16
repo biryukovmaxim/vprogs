@@ -119,7 +119,6 @@ fn open_scheduler(path: &Path, gate: Arc<Gate>) -> Scheduler<RocksDbStore, Gated
 /// The second reorg target must be a fresh block hash. Flipping back onto the canceled block's
 /// hash would reuse its retained id through the manager's reverse index and refill the gap.
 #[test]
-#[ignore = "repro for the reorg-canceled batch id gap: fails at restart until the gap is fixed"]
 #[allow(clippy::assertions_on_constants)]
 fn canceled_tip_batch_strands_an_id_and_bricks_restart() {
     // The debug_assert_eq! in CanonicalChainManager::new catches the non-contiguous replay and
