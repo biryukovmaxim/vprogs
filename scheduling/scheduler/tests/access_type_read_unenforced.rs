@@ -25,8 +25,8 @@ const WRITTEN: &[u8] = b"written";
 
 /// A processor that writes every resource it is handed, regardless of the declared access type.
 ///
-/// Mirrors the real risc0 transaction processor, which consults no access type: `zk/` contains no
-/// reference to `access_type` at all.
+/// Mirrors the real risc0 transaction processor, which consults no access type:
+/// `Resource::access_type()` has no call sites anywhere in the repository.
 #[derive(Clone)]
 struct UnconditionalWriter;
 
@@ -41,9 +41,19 @@ impl<S: Store> vprogs_scheduling_scheduler::Processor<S> for UnconditionalWriter
         Ok(())
     }
 
+    // This processor never proves, so its image ids only need to be stable.
+    fn tx_image_id(&self) -> [u8; 32] {
+        [0u8; 32]
+    }
+
+    fn batch_image_id(&self) -> [u8; 32] {
+        [1u8; 32]
+    }
+
     type Transaction = usize;
-    type TransactionArtifact = ();
-    type BatchArtifact = ();
+    type TransactionArtifact = Vec<u8>;
+    type BatchArtifact = Vec<u8>;
+    type AggregatorArtifact = Vec<u8>;
     type BatchMetadata = u64;
     type Error = ();
 }
@@ -75,8 +85,8 @@ fn write_to_a_read_declared_resource_must_not_be_silently_dropped() {
     let batch = scheduler.schedule(
         1,
         vec![
-            SchedulerTransaction::new(0, vec![AccessMetadata::read(read_declared)]),
-            SchedulerTransaction::new(1, vec![AccessMetadata::write(write_declared)]),
+            SchedulerTransaction::new(0, vec![AccessMetadata::read(read_declared)], 0),
+            SchedulerTransaction::new(1, vec![AccessMetadata::write(write_declared)], 1),
         ],
     );
     batch.wait_committed_blocking();
