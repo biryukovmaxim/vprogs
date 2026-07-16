@@ -3,7 +3,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use kaspa_consensus_core::network::NetworkId;
+use kaspa_consensus_core::{config::params::Params, network::NetworkId};
+use kaspa_rpc_core::api::rpc::RpcApi;
 use tokio::sync::mpsc;
 use vprogs_core_types::{ChainSink, SchedulerTransaction};
 use vprogs_l1_bridge::{Command, L1Bridge, L1BridgeConfig, L1Event};
@@ -13,6 +14,9 @@ use vprogs_storage_canonical_chain::CanonicalChainManager;
 
 // Timeout for waiting for events / scheduled blocks.
 const TIMEOUT: Duration = Duration::from_secs(30);
+
+// Timeout for waiting on a sync that spans hundreds of mined blocks.
+const LONG_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// A [`ChainSink`] that records what the bridge drives into it, for assertions.
 ///
@@ -30,6 +34,8 @@ struct SinkInner {
     scheduled: Vec<(u64, ChainBlockMetadata, usize)>,
     /// The `new_tip` of each reorg, in order.
     reorgs: Vec<u64>,
+    /// The `below` argument of each finalization, in order.
+    finalized: Vec<u64>,
 }
 
 impl RecordingSink {
@@ -38,6 +44,7 @@ impl RecordingSink {
             manager: CanonicalChainManager::default(),
             scheduled: Vec::new(),
             reorgs: Vec::new(),
+            finalized: Vec::new(),
         })))
     }
 
@@ -57,6 +64,11 @@ impl RecordingSink {
     /// The `new_tip` of each reorg the bridge applied.
     fn reorgs(&self) -> Vec<u64> {
         self.0.lock().unwrap().reorgs.clone()
+    }
+
+    /// The `below` argument of each finalization the bridge drove.
+    fn finalized(&self) -> Vec<u64> {
+        self.0.lock().unwrap().finalized.clone()
     }
 
     /// The highest scheduled id, or 0 if nothing has been scheduled.
@@ -108,7 +120,9 @@ impl ChainSink<ChainBlockMetadata, L1Transaction> for RecordingSink {
     }
 
     fn finalize(&mut self, below: u64) {
-        self.0.lock().unwrap().manager.finalize(below);
+        let mut inner = self.0.lock().unwrap();
+        inner.manager.finalize(below);
+        inner.finalized.push(below);
     }
 
     fn tip(&self) -> u64 {
@@ -391,4 +405,91 @@ async fn test_reorg_filter_causes_lag() {
     node2_bridge.shutdown();
     node1.shutdown().await;
     node2.shutdown().await;
+}
+
+/// Finality depth for [`shallow_pruning_params`].
+const FINALITY_DEPTH: u64 = 100;
+/// Pruning depth for [`shallow_pruning_params`], the depth a block must reach to be pruned.
+const PRUNING_DEPTH: u64 = 200;
+
+/// Consensus parameters that put a pruning-point advance within reach of a test: the pruning point
+/// moves off genesis after a few hundred mined blocks rather than the hundreds of thousands the
+/// simnet defaults require. Mirrors the shape the L1 node's own pruning tests use.
+fn shallow_pruning_params(p: &mut Params) {
+    p.timestamp_deviation_tolerance = 16;
+    p.difficulty_window_size = 32;
+    p.min_difficulty_window_size = 16;
+    p.pruning_proof_m = 16;
+    p.blockrate.target_time_per_block = 100;
+    p.blockrate.ghostdag_k = 10;
+    p.blockrate.past_median_time_sample_rate = 1;
+    p.blockrate.difficulty_sample_rate = 1;
+    p.blockrate.max_block_parents = 10;
+    p.blockrate.mergeset_size_limit = 32;
+    p.blockrate.merge_depth = 64;
+    p.blockrate.finality_depth = FINALITY_DEPTH;
+    p.blockrate.pruning_depth = PRUNING_DEPTH;
+    p.blockrate.coinbase_maturity = 10;
+}
+
+/// Verifies the bridge advances finalization when a synced node's pruning point moves, which is the
+/// only way finalization ever advances in production: a live node reaches its pruning depth while
+/// steadily following the chain, never through IBD.
+///
+/// The bridge drives finalization solely from the `PruningPointUtxoSetOverride` notification, which
+/// an L1 node emits only from the IBD path (`sync_new_utxo_set`), never on a routine pruning-point
+/// advance. So the sink's `finalize` is never called, nothing is ever dropped from the canonical
+/// chain, and the bridge's documented "advances finalization" contract does not hold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "repro: finalization never advances on a live node; the bridge's only finalize trigger \
+            is the IBD-only PruningPointUtxoSetOverride notification"]
+async fn test_bridge_finalizes_on_steady_state_pruning_advance() {
+    let node = L1Node::new(NetworkId::new(NetworkType::Simnet), Some(shallow_pruning_params)).await;
+    let genesis_pruning_hash = node.grpc_client().get_block_dag_info().await.unwrap().pruning_point_hash;
+
+    let sink = RecordingSink::new();
+    let config = L1BridgeConfig::default()
+        .with_url(Some(node.wrpc_borsh_url()))
+        .with_network_type(NetworkType::Simnet)
+        .with_connect_strategy(ConnectStrategy::Fallback)
+        .with_filter_half_life(Duration::ZERO)
+        .with_finality_depth(FINALITY_DEPTH);
+    let (api_tx, api_rx) = mpsc::channel(1);
+    let bridge = L1Bridge::new(config, sink.clone(), api_rx);
+    let _api: ApiGuard = api_tx;
+    bridge.wait_for(TIMEOUT, |e| matches!(e, L1Event::Connected)).await;
+
+    // Mine past the pruning depth on this single, always-synced node. No peer ever connects, so no
+    // IBD runs and the pruning point advances purely as steady-state consensus progress.
+    let mined = node.mine_blocks(PRUNING_DEPTH as usize + 120).await;
+    sink.wait_for_block(*mined.last().unwrap(), LONG_TIMEOUT).await;
+
+    // Precondition: the node's pruning point really did advance off genesis. Without this the
+    // finalization assertion below would pass vacuously on a chain that never pruned.
+    let dag_info = node.grpc_client().get_block_dag_info().await.unwrap();
+    assert_ne!(
+        dag_info.pruning_point_hash, genesis_pruning_hash,
+        "the node's pruning point must advance off genesis for this test to mean anything",
+    );
+
+    // The bridge must have scheduled the new pruning point, since `handle_finalization` finalizes
+    // only ids the sink already knows.
+    let pruning_id = sink
+        .scheduled()
+        .iter()
+        .find(|(_, m, _)| m.hash == dag_info.pruning_point_hash)
+        .map(|(id, _, _)| *id)
+        .expect("the bridge should have scheduled the new pruning point");
+
+    // Give the bridge a window to observe the advance and finalize.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    assert_eq!(
+        sink.finalized(),
+        vec![pruning_id],
+        "the bridge should finalize the sink up to the advanced pruning point (id {pruning_id})",
+    );
+
+    bridge.shutdown();
+    node.shutdown().await;
 }
