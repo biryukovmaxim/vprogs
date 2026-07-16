@@ -2809,7 +2809,6 @@ fn fresh_root_at_1(payload: usize) -> [u8; 32] {
 /// discriminate payloads whenever `store.update` runs, and its passing across the restore is
 /// therefore evidence that `store.update` did not run.
 #[test]
-#[ignore = "repro: demonstrates test_restore_smt_root_is_idempotent asserts nothing"]
 pub fn test_restore_smt_root_idempotence_assertion_is_vacuous() {
     // The control: committed through the non-restored path, the payloads under test disagree.
     // Without this, root(1) holding still across the restore would be equally explained by root(1)

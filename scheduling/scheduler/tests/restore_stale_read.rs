@@ -114,7 +114,6 @@ impl Tree for GatedStore {
 /// only after every value under test has been read, so block 1's commit cannot land inside the
 /// window. Restores are pure reads and are never held.
 #[test]
-#[ignore = "repro: restored read-only access resolves through the stale disk latest pointer"]
 fn test_restored_read_only_access_forwards_stale_disk_value() {
     let temp_dir = TempDir::new().expect("failed to create temp dir");
     let gate = Arc::new(Gate::default());
