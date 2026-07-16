@@ -10,7 +10,7 @@
 //! first's receipt: a valid proof of a statement it did not ask for.
 //!
 //! ```text
-//! cargo test -p vprogs-zk-aggregate-prover --test receipt_cache_pin_omission -- --ignored
+//! cargo test -p vprogs-zk-aggregate-prover --test receipt_cache_pin_omission
 //! ```
 //!
 //! Scope: these tests establish the key-domain defect, which holds unconditionally. They do not
@@ -268,7 +268,6 @@ fn next_bundle(
 ///
 /// [`BatchPins`]: vprogs_zk_abi::batch_processor::BatchPins
 #[test]
-#[ignore = "repro: G6 -- BatchKey omits BatchPins, so a receipt proved under one configuration is served for another at the same chain coordinate"]
 fn batch_cache_does_not_reuse_a_receipt_across_pins() {
     let temp_dir = TempDir::new().expect("failed to create temp dir");
     let storage: RocksDbStore = RocksDbStore::open(temp_dir.path());
@@ -334,7 +333,6 @@ fn batch_cache_does_not_reuse_a_receipt_across_pins() {
 /// hands settlement an artifact proving the wrong lane's transition. The lane key is never checked
 /// on the hit path, unlike `covenant_id`, which is checked when one is configured.
 #[test]
-#[ignore = "repro: G6 -- AggregatorKey omits lane_key, so a bundle receipt proved for one lane is served for another at the same coordinate"]
 fn aggregate_cache_does_not_reuse_a_receipt_across_lane_keys() {
     let temp_dir = TempDir::new().expect("failed to create temp dir");
     let storage: RocksDbStore = RocksDbStore::open(temp_dir.path());

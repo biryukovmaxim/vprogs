@@ -12,7 +12,7 @@
 //!
 //! ```text
 //! RUSTFLAGS="-C debug-assertions=off" cargo test -p vprogs-zk-aggregate-prover \
-//!     --test receipt_cache_poisoning -- --ignored --test-threads=1
+//!     --test receipt_cache_poisoning -- --test-threads=1
 //! ```
 
 // The backend traits return `impl Future + 'static`, which an `async fn` cannot satisfy: its future
@@ -218,8 +218,19 @@ fn next_bundle(
 /// not prove the statement its key names, and the covenant will reject the settlement built from it
 /// for the lifetime of the store.
 #[test]
-#[ignore = "repro: G6 -- the divergent receipt is cached because the seq_commit binding is a debug_assert placed after the store write; run with -C debug-assertions=off"]
+#[allow(clippy::assertions_on_constants)]
 fn divergent_seq_commit_receipt_is_not_cached() {
+    // The debug_assert_eq! in the aggregate worker fires before the cache write and panics the
+    // worker task, after which this test blocks forever waiting on an artifact that is never
+    // published. Only a debug-assertions-off build exercises the real defect. The condition is a
+    // compile-time constant on purpose: it must fail the run rather than hang it.
+    assert!(
+        !cfg!(debug_assertions),
+        "run this repro with debug assertions off (RUSTFLAGS=\"-C debug-assertions=off\"), \
+         otherwise the debug_assert_eq! in the aggregate worker panics the worker task and this \
+         test hangs instead of demonstrating the cache write under test"
+    );
+
     let temp_dir = TempDir::new().expect("failed to create temp dir");
     let storage: RocksDbStore = RocksDbStore::open(temp_dir.path());
     let mut scheduler = Scheduler::new(
@@ -285,8 +296,19 @@ fn divergent_seq_commit_receipt_is_not_cached() {
 /// coordinate, so it hits the same key. The worker serves the stored receipt without re-proving and
 /// without ever reaching the check, so the retry submits the identical doomed settlement.
 #[test]
-#[ignore = "repro: G6 -- a retry at the same coordinate is served the cached divergent receipt and never re-proves; run with -C debug-assertions=off"]
+#[allow(clippy::assertions_on_constants)]
 fn retry_does_not_serve_the_cached_divergent_receipt() {
+    // The debug_assert_eq! in the aggregate worker fires before the cache write and panics the
+    // worker task, after which this test blocks forever waiting on an artifact that is never
+    // published. Only a debug-assertions-off build exercises the real defect. The condition is a
+    // compile-time constant on purpose: it must fail the run rather than hang it.
+    assert!(
+        !cfg!(debug_assertions),
+        "run this repro with debug assertions off (RUSTFLAGS=\"-C debug-assertions=off\"), \
+         otherwise the debug_assert_eq! in the aggregate worker panics the worker task and this \
+         test hangs instead of demonstrating the cache write under test"
+    );
+
     let temp_dir = TempDir::new().expect("failed to create temp dir");
     let storage: RocksDbStore = RocksDbStore::open(temp_dir.path());
     let mut scheduler = Scheduler::new(
