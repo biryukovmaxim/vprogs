@@ -112,7 +112,6 @@ mod tests {
     /// contract for malformed user input is `Err`: the guest must not panic on
     /// bytes an L1 transaction chooses.
     #[test]
-    #[ignore = "repro: recover_prev_tx_v1_p2pk_pubkey asserts instead of returning Err; un-ignore with the fix"]
     fn witness_not_matching_outpoint_returns_err_rather_than_panicking() {
         let current_rest_preimage = rest_preimage_with_one_input(&[0xAA; 32]);
         let witness_rest_preimage = b"witness bytes that do not hash to the named outpoint";
