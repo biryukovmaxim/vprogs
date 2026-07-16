@@ -69,8 +69,6 @@ impl<S: Store> vprogs_scheduling_scheduler::Processor<S> for UnconditionalWriter
 /// Either enforcement point closes this: reject the transaction, or honor the write. The Write
 /// control in the same batch shows the machinery works when the declaration matches.
 #[test]
-#[ignore = "repro: AccessType::Read is declared by the user and enforced by nobody; the write is \
-            silently dropped"]
 fn write_to_a_read_declared_resource_must_not_be_silently_dropped() {
     let temp_dir = TempDir::new().expect("failed to create temp dir");
     let storage: RocksDbStore = RocksDbStore::open(temp_dir.path());

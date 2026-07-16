@@ -11,7 +11,7 @@
 //!
 //! Both tests assert an invariant that must hold, so both fail against unfixed code. Either
 //! enforcement point closes them: reject a transaction whose declaration does not cover what it
-//! wrote, or honor the write. Un-ignore them as the acceptance criterion for a fix.
+//! wrote, or honor the write. Their passing is the acceptance criterion for a fix.
 //!
 //! Both run the real `Vm`, the real risc0 transaction-processor guest, the real batch-processor
 //! guest, the real batch prover and the real scheduler, against a real simnet L1 node. No mock
@@ -153,8 +153,6 @@ fn state_transition(receipt: &Receipt) -> ([u8; 32], [u8; 32]) {
 ///
 /// This proves the divergence only. It does not prove that the lane wedges.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "repro: AccessType::Read is enforced by nobody; the guest's write diverges the settled \
-            state from the host store"]
 async fn settled_state_must_match_host_root_when_guest_writes_a_read_declared_resource() {
     let mut fx = Fixture::new(1).await;
 
@@ -196,8 +194,6 @@ async fn settled_state_must_match_host_root_when_guest_writes_a_read_declared_re
 /// Unlike the aggregator's existing chain tests, which hand-build `BatchTransition` journals, both
 /// journals here are produced by the real pipeline: the divergence is not injected.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "repro: AccessType::Read is enforced by nobody; the divergent batch permanently breaks \
-            the aggregator's prev_state chain"]
 async fn bundle_must_aggregate_after_a_read_declared_write() {
     let mut fx = Fixture::new(2).await;
 
