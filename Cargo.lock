@@ -8554,6 +8554,7 @@ name = "vprogs-l1-bridge"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "borsh",
  "crossbeam-queue",
  "futures",
  "kaspa-consensus-core",
@@ -8565,6 +8566,7 @@ dependencies = [
  "tap",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-tungstenite",
  "vprogs-core-atomics",
  "vprogs-core-macros",
  "vprogs-core-types",
@@ -8572,6 +8574,8 @@ dependencies = [
  "vprogs-node-test-utils",
  "vprogs-storage-canonical-chain",
  "workflow-core",
+ "workflow-rpc",
+ "workflow-serializer",
 ]
 
 [[package]]
