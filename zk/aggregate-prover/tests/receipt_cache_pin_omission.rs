@@ -6,16 +6,16 @@
 //! only the checkpoint index, the block hash, and the batch image id. The aggregate statement
 //! commits `lane_key` and the batch image id, while `AggregatorKey` holds only the bundle's start
 //! coordinate, the aggregator image id, and the claimed final `seq_commit`. Two provers at the same
-//! chain coordinate under different pins therefore share a key, and the second is served the first's
-//! receipt: a valid proof of a statement it did not ask for.
+//! chain coordinate under different pins therefore share a key, and the second is served the
+//! first's receipt: a valid proof of a statement it did not ask for.
 //!
 //! ```text
 //! cargo test -p vprogs-zk-aggregate-prover --test receipt_cache_pin_omission -- --ignored
 //! ```
 //!
 //! Scope: these tests establish the key-domain defect, which holds unconditionally. They do not
-//! establish the denial-of-service exploit, which additionally requires a receipt store to survive a
-//! lane or configuration change across a restart. The configuration change here is modelled by a
+//! establish the denial-of-service exploit, which additionally requires a receipt store to survive
+//! a lane or configuration change across a restart. The configuration change here is modelled by a
 //! second prover over the same live store, not by a real restart.
 
 // The backend traits return `impl Future + 'static`, which an `async fn` cannot satisfy: its future
@@ -59,6 +59,9 @@ const AGGREGATOR_IMAGE_ID: [u8; 32] = [2u8; 32];
 const LANE_A: [u8; 32] = [0xa0u8; 32];
 /// Second configuration's lane key: a different lane, proving a different statement.
 const LANE_B: [u8; 32] = [0xb0u8; 32];
+/// Lane key of the sentinel artifact, which survives only if the second configuration's worker
+/// published nothing: it separates a cache hit from a worker that never ran.
+const LANE_UNPROVED: [u8; 32] = [0xccu8; 32];
 
 /// Backend pinned to one configuration: its receipts commit that configuration's `lane_key`, and it
 /// counts proofs so a cache hit is visible.
@@ -285,6 +288,10 @@ fn batch_cache_does_not_reuse_a_receipt_across_pins() {
     wait_for(|| backend_a.batch_proofs.load(Ordering::SeqCst) == 1, "config A proves the batch");
     prover_a.shutdown();
 
+    // Overwrite the handle's artifact with a sentinel, so what configuration B's worker publishes
+    // is distinguishable from what configuration A's left behind.
+    batch.publish_artifact(Some(state_transition_journal(Hash::from_bytes(LANE_UNPROVED))));
+
     // The second configuration, at the same chain coordinate, proves a different statement: a
     // different lane, covenant, deposit address, and transaction image.
     let backend_b = PinnedBackend::new(LANE_B);
@@ -299,6 +306,12 @@ fn batch_cache_does_not_reuse_a_receipt_across_pins() {
     prover_b.shutdown();
     scheduler.shutdown();
 
+    assert_ne!(
+        published,
+        Hash::from_bytes(LANE_UNPROVED),
+        "configuration B's worker must publish a batch artifact: the sentinel means it never ran, \
+         so the reuse assertion below would not be reached on its merits",
+    );
     assert_eq!(
         published,
         Hash::from_bytes(LANE_B),
@@ -334,11 +347,7 @@ fn aggregate_cache_does_not_reuse_a_receipt_across_lane_keys() {
     // path and never consult the cache.
     let batch = scheduler.schedule(
         chain_block(),
-        vec![SchedulerTransaction::new(
-            0,
-            vec![AccessMetadata::write(ResourceId::for_test(1))],
-            0,
-        )],
+        vec![SchedulerTransaction::new(0, vec![AccessMetadata::write(ResourceId::for_test(1))], 0)],
     );
     batch.wait_processed_blocking();
     batch.publish_artifact(Some(vec![0xbbu8; 8]));

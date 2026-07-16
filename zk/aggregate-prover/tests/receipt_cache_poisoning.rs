@@ -231,11 +231,7 @@ fn divergent_seq_commit_receipt_is_not_cached() {
     // would take the no-op path and never reach the cache write.
     let batch = scheduler.schedule(
         final_block(),
-        vec![SchedulerTransaction::new(
-            0,
-            vec![AccessMetadata::write(ResourceId::for_test(1))],
-            0,
-        )],
+        vec![SchedulerTransaction::new(0, vec![AccessMetadata::write(ResourceId::for_test(1))], 0)],
     );
     batch.wait_processed_blocking();
     batch.publish_artifact(Some(vec![0xbbu8; 8]));
@@ -300,11 +296,7 @@ fn retry_does_not_serve_the_cached_divergent_receipt() {
 
     let batch = scheduler.schedule(
         final_block(),
-        vec![SchedulerTransaction::new(
-            0,
-            vec![AccessMetadata::write(ResourceId::for_test(1))],
-            0,
-        )],
+        vec![SchedulerTransaction::new(0, vec![AccessMetadata::write(ResourceId::for_test(1))], 0)],
     );
     batch.wait_processed_blocking();
     batch.publish_artifact(Some(vec![0xbbu8; 8]));
