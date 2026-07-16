@@ -441,8 +441,6 @@ fn shallow_pruning_params(p: &mut Params) {
 /// advance. So the sink's `finalize` is never called, nothing is ever dropped from the canonical
 /// chain, and the bridge's documented "advances finalization" contract does not hold.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "repro: finalization never advances on a live node; the bridge's only finalize trigger \
-            is the IBD-only PruningPointUtxoSetOverride notification"]
 async fn test_bridge_finalizes_on_steady_state_pruning_advance() {
     let node = L1Node::new(NetworkId::new(NetworkType::Simnet), Some(shallow_pruning_params)).await;
     let genesis_pruning_hash =
