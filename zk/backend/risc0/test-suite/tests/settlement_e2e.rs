@@ -73,11 +73,10 @@ fn verify_settlement_onchain(
     accessor: &dyn SeqCommitAccessor,
 ) -> ScriptUnits {
     let tx = &settlement.transaction;
-    // The covenant UTXO being spent supplies the value distributed across all outputs:
-    // count==1 → continuation carries the full input.value; count==2 → continuation +
-    // permission output sum to input.value. Either way, summing the outputs reproduces the
-    // UTXO amount and keeps the script engine's fee check (inputs >= outputs) happy.
-    let utxo_value: u64 = tx.outputs.iter().map(|o| o.value).sum();
+    // The covenant UTXO's value, per the redeem's `verify_continuation_value` (`out0 == in0`). A
+    // permission output is settler-funded, so it is no part of the covenant's own value; the real
+    // transaction carries the funding input balancing it, but this harness runs only input 0.
+    let utxo_value: u64 = tx.outputs[0].value;
     let utxo = UtxoEntry::new(
         utxo_value,
         pay_to_script_hash_script(&settlement.prev_redeem),
@@ -744,7 +743,7 @@ async fn batch_proof_bundles_two_batches() {
 /// variant that emits one L2→L1 exit per tx, so the bundle's journal carries a non-zero
 /// `permission_spk_hash`. The settlement consequently takes the count==2 path:
 /// - 2 covenant-bound outputs (continuation + permission exit).
-/// - Continuation value = `input.value - DEFAULT_PERMISSION_OUTPUT_VALUE`.
+/// - Continuation value = `input.value` (the exit is settler-funded, not drawn from the covenant).
 /// - Permission output SPK = `permission_spk(parsed.permission_spk_hash)`, value =
 ///   `DEFAULT_PERMISSION_OUTPUT_VALUE`.
 ///
@@ -921,7 +920,10 @@ async fn batch_with_exits_takes_two_output_settlement_path() {
     // Output 0: continuation. P2SH of next_redeem, covenant binding (0, covenant_id).
     let continuation = &settlement.transaction.outputs[0];
     assert_eq!(continuation.script_public_key, pay_to_script_hash_script(&settlement.next_redeem),);
-    assert_eq!(continuation.value, covenant_value - DEFAULT_PERMISSION_OUTPUT_VALUE);
+    assert_eq!(
+        continuation.value, covenant_value,
+        "the exit is settler-funded, so the covenant carries forward undrawn",
+    );
     assert_eq!(continuation.covenant, Some(CovenantBinding::new(0, covenant_id_hash)));
 
     // Output 1: permission exit. SPK matches the journal-bound hash, value matches the pinned

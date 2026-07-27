@@ -170,7 +170,10 @@ async fn deposit_and_withdraw_settle_with_deposit_and_permission_commitments() {
     assert_eq!(settlement.transaction.outputs.len(), 2, "exits must produce 2 covenant outputs");
     let continuation = &settlement.transaction.outputs[0];
     assert_eq!(continuation.script_public_key, pay_to_script_hash_script(&settlement.next_redeem));
-    assert_eq!(continuation.value, covenant_value - DEFAULT_PERMISSION_OUTPUT_VALUE);
+    assert_eq!(
+        continuation.value, covenant_value,
+        "the exit is settler-funded, so the covenant carries forward undrawn",
+    );
     assert_eq!(continuation.covenant, Some(CovenantBinding::new(0, covenant_id_hash)));
     let exit = &settlement.transaction.outputs[1];
     assert_eq!(exit.script_public_key, permission_spk(&parsed.permission_spk_hash));

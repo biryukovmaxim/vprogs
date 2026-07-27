@@ -25,8 +25,8 @@ pub struct SettlementInput<'a> {
     pub block_prove_to: Hash,
     /// UTXO outpoint of the covenant being spent.
     pub prev_outpoint: TransactionOutpoint,
-    /// Value carried on the covenant UTXO. Split between continuation and permission outputs
-    /// when [`Self::permission_spk_hash`] is non-zero (see
+    /// Value carried on the covenant UTXO, and equally the continuation output's value: the
+    /// covenant is never drawn down, including when it emits a permission exit (see
     /// [`Settlement::build`](super::Settlement::build)).
     pub value: u64,
     /// Proof-system-tagged ZK witness bytes pushed onto the redeem-spending sig_script. Must
@@ -34,7 +34,7 @@ pub struct SettlementInput<'a> {
     pub witness: SettlementWitness<'a>,
     /// `blake2b(perm_redeem_script)` from the batch journal. Non-zero →
     /// [`Settlement::build`](super::Settlement::build) emits a second covenant-bound P2SH exit
-    /// output of value `pins.common().permission_output_value`. `[0; 32]` → single continuation
-    /// output (no exits in this batch).
+    /// output of value `pins.common().permission_output_value`, which the caller funds from its
+    /// own inputs. `[0; 32]` → single continuation output (no exits in this batch).
     pub permission_spk_hash: &'a [u8; 32],
 }
