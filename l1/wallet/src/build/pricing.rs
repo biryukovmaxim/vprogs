@@ -16,7 +16,7 @@ use kaspa_consensus_core::{
 /// the degraded fundings where [`FeePolicy::TargetFeerate`] cannot reach its target, but never a
 /// target rate actually paid: the node clamps its own fee-estimate buckets to its configured
 /// minimum, and priority mass is never below the fee-binding mass.
-pub(super) const MIN_FEERATE_PER_GRAM: u64 = 100;
+pub const MIN_FEERATE_PER_GRAM: u64 = 100;
 
 /// How a builder prices its fee.
 #[derive(Debug, Clone, Copy)]
@@ -38,7 +38,7 @@ pub enum FeePolicy {
 /// so pricing a zero-fee probe of the same layout is exact for the final transaction. Call
 /// this on a *signed* layout so the signature scripts are counted (an unsigned tx has empty
 /// sig scripts and undercounts both masses).
-pub(super) fn min_fee(params: &Params, tx: &Transaction) -> u64 {
+pub fn min_fee(params: &Params, tx: &Transaction) -> u64 {
     let calc = MassCalculator::new(
         params.mass_per_tx_byte,
         params.mass_per_script_pub_key_byte,

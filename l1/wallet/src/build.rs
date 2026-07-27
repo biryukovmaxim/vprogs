@@ -22,7 +22,7 @@ pub use bootstrap::covenant_bootstrap_transaction;
 pub use carrier::{SignedCarrierTx, signed_carrier_transaction};
 pub use funding::BuildError;
 pub use payout::{PayToAddressTx, pay_to_address_transaction};
-pub use pricing::FeePolicy;
+pub use pricing::{FeePolicy, MIN_FEERATE_PER_GRAM, min_fee};
 pub use settlement::{SettlementTx, settlement_transaction};
 pub use viability::commit_storage_mass;
 

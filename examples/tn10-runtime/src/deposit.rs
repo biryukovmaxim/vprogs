@@ -22,40 +22,21 @@ use kaspa_consensus_core::{
     config::params::Params,
     constants::TX_VERSION_TOCCATA,
     hashing::tx::transaction_v1_rest_preimage,
-    mass::MassCalculator,
     sign::sign,
     subnets::{SUBNETWORK_ID_NATIVE, SubnetworkId},
     tx::{
-        MutableTransaction, PopulatedTransaction, Transaction, TransactionInput,
-        TransactionOutpoint, TransactionOutput, UtxoEntry,
+        MutableTransaction, Transaction, TransactionInput, TransactionOutpoint, TransactionOutput,
+        UtxoEntry,
     },
 };
 use kaspa_txscript::{pay_to_address_script, standard::pay_to_script_hash_script};
 use secp256k1::{Keypair, SECP256K1, SecretKey};
 use vprogs_l1_utils::payload_digest_v1;
-use vprogs_l1_wallet::build::commit_storage_mass;
+use vprogs_l1_wallet::build::{commit_storage_mass, min_fee};
 use vprogs_zk_backend_risc0_api::build_delegate_entry_script;
 use vprogs_zk_backend_risc0_runtime_processor::genesis::GENESIS_SCHNORR_BYTES;
 
 use crate::actions::{self, TestSigner};
-
-/// mempool floor: a transaction's fee must be at least this many sompi per mass gram.
-const MIN_FEERATE_PER_GRAM: u64 = 100;
-
-/// The minimum sompi fee the node's mempool requires for `tx`: [`MIN_FEERATE_PER_GRAM`] times the
-/// binding mass (the larger of compute and KIP-0009 storage mass). Mirrors the wallet's private
-/// helper; called on the final signed tx so signature scripts are counted.
-fn min_fee(params: &Params, tx: &Transaction, entries: &[UtxoEntry]) -> u64 {
-    let calc = MassCalculator::new(
-        params.mass_per_tx_byte,
-        params.mass_per_script_pub_key_byte,
-        params.storage_mass_parameter,
-    );
-    let compute = calc.calc_non_contextual_masses(tx).compute_mass;
-    let populated = PopulatedTransaction::new(tx, entries.to_vec());
-    let storage = calc.calc_contextual_masses(&populated).map_or(0, |m| m.storage_mass);
-    MIN_FEERATE_PER_GRAM * compute.max(storage)
-}
 
 /// Builds the `rest_preimage` of a single-output funding tx paying `value` sompi to the covenant
 /// deposit address `P2SH(delegate_entry_script(covenant_id))`. This is what the guest parses for a
@@ -128,25 +109,9 @@ pub fn build_deposit_transaction(args: DepositTx<'_>) -> Transaction {
         signed
     };
 
-    // For a 2-output tx (deposit + change) the KIP-0009 storage mass depends on the change value,
-    // so pricing off a zero-fee probe underprices: shrinking change by the fee raises the
-    // required fee above the probe's estimate. Iterate the fee to a fixpoint instead, repricing
-    // each round on the tx actually built with the current fee (its real change output). The
-    // sequence is monotone non-decreasing (a smaller change never lowers storage mass) and
-    // converges; a handful of rounds suffices, and reaching the fixpoint means the built tx
-    // pays at least its own min fee.
-    const MAX_ROUNDS: u32 = 8;
-    let mut fee = min_fee(args.params, &build(0), &entries);
-    let mut converged = false;
-    for _ in 0..MAX_ROUNDS {
-        let next = min_fee(args.params, &build(fee), &entries);
-        if next == fee {
-            converged = true;
-            break;
-        }
-        fee = next;
-    }
-    assert!(converged, "deposit fee did not converge within {MAX_ROUNDS} rounds (fee {fee})");
+    // Both fee-binding masses depend only on the serialized byte layout, and the fee rides in a
+    // fixed-width output field, so the zero-fee probe prices the funded tx exactly.
+    let fee = min_fee(args.params, &build(0));
     assert!(
         args.entry.amount > args.deposit_value + fee,
         "funding UTXO {} too small for deposit {} + fee {}",
@@ -207,7 +172,7 @@ pub fn build_lane_action_transaction(args: LaneActionTx<'_>) -> Transaction {
 
     let placeholder = vec![0u8; payload_len];
     let probe = build(0, placeholder.clone());
-    let fee = min_fee(args.params, &probe, &entries);
+    let fee = min_fee(args.params, &probe);
     assert!(
         args.entry.amount > fee,
         "funding UTXO {} too small for fee {}",
@@ -312,7 +277,7 @@ pub fn build_genesis_init_transaction(args: GenesisInitTx<'_>) -> Transaction {
 
     // Zero-fee probe to learn the signed mass, price it at the node floor, then rebuild funded.
     let probe = build(0);
-    let fee = min_fee(args.params, &probe, &entries);
+    let fee = min_fee(args.params, &probe);
     assert!(
         entry.amount > fee,
         "genesis funding output {} too small for Init fee {}",
@@ -363,10 +328,10 @@ mod tests {
             params: &params,
         });
 
-        // The tx must pay at least its own node-floor min fee, priced on its real (shrunk) change.
+        // The tx must pay at least its own node-floor min fee, repriced on the tx as built.
         let change = tx.outputs[1].value;
         let fee_paid = funding - deposit_value - change;
-        let required = min_fee(&params, &tx, &[entry]);
+        let required = min_fee(&params, &tx);
         assert!(fee_paid >= required, "deposit underpaid: fee {fee_paid} < required {required}");
     }
 }
