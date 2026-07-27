@@ -502,7 +502,15 @@ async fn two_provers_reform_superseded_suffix() {
     // re-aggregation.
     const DRIVER_ITERS: usize = 8;
     const CARRIERS_PER_RANGE: usize = 5;
-    for i in 0..DRIVER_ITERS {
+    // Settlements the contended ranges must land before the drain begins.
+    const MIN_PRE_DRAIN_SETTLEMENTS: usize = 3;
+    // Ceiling on driver iterations. Past `DRIVER_ITERS` the loop keeps driving ranges until the
+    // chain reaches `MIN_PRE_DRAIN_SETTLEMENTS` rather than stopping at a fixed count: dev proving
+    // runs on the CPU, so on a loaded host it trails the driver and a fixed range count would
+    // reach the assertion with the chain still catching up.
+    const MAX_DRIVER_ITERS: usize = 40;
+    let mut pre_drain_len = 0;
+    for i in 0..MAX_DRIVER_ITERS {
         for _ in 0..CARRIERS_PER_RANGE {
             let payload = encode_activity_payload(
                 &[AccessMetadata::write(ResourceId::for_test(1))],
@@ -520,20 +528,25 @@ async fn two_provers_reform_superseded_suffix() {
             l1.mine_blocks(1).await;
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
+
+        // Residual suffixes proved past here may still be in flight, superseded and awaiting
+        // re-aggregation against the adopted tip.
+        pre_drain_len =
+            covenant_chain(&l1, block_deploy, bootstrap_outpoint, covenant_id).await.len();
         if i % 4 == 0 {
-            let len =
-                covenant_chain(&l1, block_deploy, bootstrap_outpoint, covenant_id).await.len();
-            eprintln!("reform driver: iteration {i}/{DRIVER_ITERS}, covenant chain length {len}");
+            eprintln!(
+                "reform driver: iteration {i}/{MAX_DRIVER_ITERS}, covenant chain length \
+                 {pre_drain_len}",
+            );
+        }
+        if i + 1 >= DRIVER_ITERS && pre_drain_len >= MIN_PRE_DRAIN_SETTLEMENTS {
+            break;
         }
     }
-
-    // Pre-drain chain length: residual suffixes proved past here may still be in flight, superseded
-    // and awaiting re-aggregation against the adopted tip.
-    let pre_drain_len =
-        covenant_chain(&l1, block_deploy, bootstrap_outpoint, covenant_id).await.len();
     assert!(
-        pre_drain_len >= 3,
-        "the two provers must land >=3 settlements under contention before the drain, got {pre_drain_len}",
+        pre_drain_len >= MIN_PRE_DRAIN_SETTLEMENTS,
+        "the two provers must land >={MIN_PRE_DRAIN_SETTLEMENTS} settlements under contention \
+         before the drain, got {pre_drain_len}",
     );
 
     // === Step 5: acceptance-only drain - NO fresh ranges ===
