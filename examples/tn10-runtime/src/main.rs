@@ -173,10 +173,9 @@ fn spawn_driver(
         for (i, account) in accounts.iter().enumerate() {
             let recipient = Wallet::new(&client, &params, account.l1).address().clone();
             let label = format!("distribution to account {i}");
-            let submitted = fund_and_submit(&label, &wallet, |outpoint, entry| {
+            let submitted = fund_and_submit(&label, &wallet, |candidates| {
                 pay_to_address_transaction(PayToAddressTx {
-                    outpoint,
-                    entry,
+                    candidates,
                     recipient: &recipient,
                     value: funding,
                     count: 1,
@@ -184,6 +183,8 @@ fn spawn_driver(
                     change_address: wallet.address(),
                     params: &params,
                 })
+                .inspect_err(|e| log::warn!("{label} funding failed: {e}"))
+                .ok()
             })
             .await;
             match submitted {
@@ -259,27 +260,29 @@ fn is_transient_submit_error(err: &impl std::fmt::Display) -> bool {
     msg.contains("orphan") || msg.contains("timed out") || msg.contains("timeout")
 }
 
-/// Fetches the wallet's largest spendable UTXO, builds a tx from it with `build`, and submits,
-/// retrying a transient rejection with back-off. Re-fetches and rebuilds each attempt so a carrier
-/// rejected against a stale UTXO selects a currently-valid one once the contending spend is mined.
-/// Returns the accepted tx id, or `None` when the wallet has no spendable UTXO or the rejection
-/// outlives [`MAX_SUBMIT_ATTEMPTS`].
+/// Fetches the wallet's spendable UTXOs (largest first), builds a tx from them with `build`, and
+/// submits, retrying a transient rejection with back-off. Re-fetches and rebuilds each attempt so a
+/// carrier rejected against a stale UTXO selects a currently-valid one once the contending spend is
+/// mined. Returns the accepted tx id, or `None` when the wallet has no spendable UTXO, `build`
+/// cannot fund the tx, or the rejection outlives [`MAX_SUBMIT_ATTEMPTS`].
 async fn fund_and_submit<C: RpcApi + ?Sized>(
     label: &str,
     wallet: &Wallet<'_, C>,
-    build: impl Fn(TransactionOutpoint, UtxoEntry) -> Transaction,
+    build: impl Fn(Vec<(TransactionOutpoint, UtxoEntry)>) -> Option<Transaction>,
 ) -> Option<Hash> {
     for attempt in 1..=MAX_SUBMIT_ATTEMPTS {
-        let utxos = match wallet.fetch_spendable_utxos().await {
+        let candidates = match wallet.fetch_spendable_utxos().await {
             Ok(utxos) => utxos,
             Err(e) => {
                 log::warn!("{label}: spendable-utxo fetch failed: {e}");
                 return None;
             }
         };
-        let (outpoint, entry) = utxos.into_iter().next()?;
+        if candidates.is_empty() {
+            return None;
+        }
 
-        let tx = build(outpoint, entry);
+        let tx = build(candidates)?;
         match wallet.submit_transaction(&tx).await {
             Ok(id) => return Some(id),
             // Transient rejection with attempts left: wait for the contending spend to mine, then
@@ -310,8 +313,9 @@ async fn submit_lane_action<C: RpcApi + ?Sized>(
     presig: Vec<u8>,
     signer: &TestSigner,
 ) -> Hash {
-    fund_and_submit("lane action", wallet, |outpoint, entry| {
-        deposit::build_lane_action_transaction(LaneActionTx {
+    fund_and_submit("lane action", wallet, |candidates| {
+        let (outpoint, entry) = candidates.into_iter().next()?;
+        Some(deposit::build_lane_action_transaction(LaneActionTx {
             presig: presig.clone(),
             signer,
             outpoint,
@@ -320,7 +324,7 @@ async fn submit_lane_action<C: RpcApi + ?Sized>(
             change_address: wallet.address(),
             subnetwork_id: lane_subnet,
             params,
-        })
+        }))
     })
     .await
     .expect("lane action did not confirm after retries")
@@ -338,8 +342,9 @@ async fn submit_deposit<C: RpcApi + ?Sized>(
     deposit_amount: u64,
     payload: Vec<u8>,
 ) -> Option<Hash> {
-    fund_and_submit("deposit", account_wallet, |outpoint, entry| {
-        deposit::build_deposit_transaction(DepositTx {
+    fund_and_submit("deposit", account_wallet, |candidates| {
+        let (outpoint, entry) = candidates.into_iter().next()?;
+        Some(deposit::build_deposit_transaction(DepositTx {
             payload: payload.clone(),
             covenant_id,
             deposit_value: deposit_amount,
@@ -349,7 +354,7 @@ async fn submit_deposit<C: RpcApi + ?Sized>(
             change_address: account_wallet.address(),
             subnetwork_id: lane_subnet,
             params,
-        })
+        }))
     })
     .await
 }

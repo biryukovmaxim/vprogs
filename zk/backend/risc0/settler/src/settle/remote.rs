@@ -58,7 +58,8 @@ impl FeeSource for WalletFeeSource {
                 .await
             {
                 Ok(funded) => {
-                    return funded.map(|(tx, fee_outpoint)| FundedSettlement { tx, fee_outpoint });
+                    return funded
+                        .map(|(tx, fee_outpoints)| FundedSettlement { tx, fee_outpoints });
                 }
                 Err(e) if attempt < MAX_ATTEMPTS => {
                     log::warn!(
