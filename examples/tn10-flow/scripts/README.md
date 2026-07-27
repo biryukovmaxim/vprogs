@@ -24,7 +24,7 @@ and a cross-node consistency check.
 
 The binary resolves its start mode from the data dir and a few env vars. A node's
 **deploy block** is the block that confirmed its covenant bootstrap tx; it is persisted
-as `bootstrap_block_hash` in `<data_dir>/tn10-flow-state.json` and is what a later run
+as `bootstrap_block_hash` in `<data_dir>/vprun-state.json` and is what a later run
 seeds the L1 bridge from.
 
 ### 1. BOOTSTRAP — deploy a fresh covenant

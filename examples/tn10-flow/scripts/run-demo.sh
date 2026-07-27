@@ -3,7 +3,7 @@
 #
 # Two-process tn10-flow demo against a real testnet-10 node:
 #   A = bootstrap node (settlement mode, key1, no covenant env) -> writes covenant_id,
-#       bootstrap_txid, lane_id to its tn10-flow-state.json once bootstrap confirms.
+#       bootstrap_txid, lane_id to its vprun-state.json once bootstrap confirms.
 #   B = catchup node (settlement mode, key2, covenant env read from A's state.json).
 #
 # Flow: fresh data dirs -> start A -> poll A's state.json for covenant_id +
@@ -36,7 +36,7 @@ KEY2="$TN10_KEY2"
 # the .orchestrator scratch dir); these data dirs are wiped on each run.
 DATA_A="$HERE/dataA"
 DATA_B="$HERE/dataB"
-STATE_A="$DATA_A/tn10-flow-state.json"
+STATE_A="$DATA_A/vprun-state.json"
 LOG_A="$HERE/logA.txt"
 LOG_B="$HERE/logB.txt"
 
