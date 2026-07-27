@@ -504,10 +504,8 @@ async fn two_provers_reform_superseded_suffix() {
     const CARRIERS_PER_RANGE: usize = 5;
     // Settlements the contended ranges must land before the drain begins.
     const MIN_PRE_DRAIN_SETTLEMENTS: usize = 3;
-    // Ceiling on driver iterations. Past `DRIVER_ITERS` the loop keeps driving ranges until the
-    // chain reaches `MIN_PRE_DRAIN_SETTLEMENTS` rather than stopping at a fixed count: dev proving
-    // runs on the CPU, so on a loaded host it trails the driver and a fixed range count would
-    // reach the assertion with the chain still catching up.
+    // Iteration ceiling. Dev proving runs on the CPU and trails the driver on a loaded host, so
+    // past `DRIVER_ITERS` the loop keeps driving ranges until the chain catches up.
     const MAX_DRIVER_ITERS: usize = 40;
     let mut pre_drain_len = 0;
     for i in 0..MAX_DRIVER_ITERS {
@@ -529,8 +527,8 @@ async fn two_provers_reform_superseded_suffix() {
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
 
-        // Residual suffixes proved past here may still be in flight, superseded and awaiting
-        // re-aggregation against the adopted tip.
+        // Settlements landed so far; suffixes proved past this length may still be in flight,
+        // superseded and awaiting re-aggregation against the adopted tip.
         pre_drain_len =
             covenant_chain(&l1, block_deploy, bootstrap_outpoint, covenant_id).await.len();
         if i % 4 == 0 {
