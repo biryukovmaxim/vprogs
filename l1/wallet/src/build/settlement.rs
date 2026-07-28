@@ -87,9 +87,8 @@ mod tests {
     use crate::build::{
         funding::fee_paid,
         testing::{
-            DEV_COVENANT_BUDGET, FUND_VALUE, PERMISSION_OUTPUT_VALUE, address,
-            assert_fee_covers_final, keypair, mempool_min_fee, outpoint, settlement_shape,
-            settlement_skeleton,
+            DEV_COVENANT_BUDGET, FUND_VALUE, address, assert_fee_covers_final, keypair,
+            mempool_min_fee, outpoint, settlement_shape, settlement_skeleton,
         },
     };
 
@@ -122,7 +121,7 @@ mod tests {
             settlement_tx: settlement_skeleton(
                 &covenant_spk,
                 covenant_id,
-                covenant_value - PERMISSION_OUTPUT_VALUE,
+                covenant_value,
                 &address,
                 100_000,
             ),

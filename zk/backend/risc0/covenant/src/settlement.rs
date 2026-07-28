@@ -71,9 +71,10 @@ impl Settlement {
     /// - **No exits** (`permission_spk_hash == [0; 32]`): one continuation output (index 0)
     ///   carrying the full input value.
     /// - **Exits** (`permission_spk_hash != [0; 32]`): two covenant-bound outputs:
-    ///   - index 0: continuation, value `input.value - pins.permission_output_value`.
+    ///   - index 0: continuation, value `input.value` (the covenant is never drawn down).
     ///   - index 1: permission exit, value `pins.permission_output_value`, SPK
-    ///     `permission_spk(input.permission_spk_hash)`.
+    ///     `permission_spk(input.permission_spk_hash)`. The caller funds this output from its own
+    ///     inputs, so the built transaction's outputs exceed its covenant input by that value.
     pub fn build(input: &SettlementInput<'_>) -> Self {
         let redeem_len = redeem_script_len(input.prev_state, &input.pins);
 
@@ -117,22 +118,17 @@ impl Settlement {
                 Some(CovenantBinding::new(0, input.covenant_id)),
             )]
         } else {
-            // Exits present: split the covenant value between the continuation (output 0) and
-            // the permission exit (output 1). Order is load-bearing - the script reads output 1
-            // by index.
-            let perm_value = input.pins.common().permission_output_value;
-            let continuation_value = input
-                .value
-                .checked_sub(perm_value)
-                .expect("covenant value must cover the permission output");
+            // Exits present: the continuation still carries the whole covenant value, and the
+            // permission exit is funded by the caller's own inputs alongside the fee. Order is
+            // load-bearing - the script reads output 1 by index.
             vec![
                 TransactionOutput::with_covenant(
-                    continuation_value,
+                    input.value,
                     pay_to_script_hash_script(&next_redeem),
                     Some(CovenantBinding::new(0, input.covenant_id)),
                 ),
                 TransactionOutput::with_covenant(
-                    perm_value,
+                    input.pins.common().permission_output_value,
                     permission_spk(input.permission_spk_hash),
                     Some(CovenantBinding::new(0, input.covenant_id)),
                 ),
@@ -169,9 +165,9 @@ impl Settlement {
         accessor: &dyn SeqCommitAccessor,
     ) -> ScriptUnits {
         let tx = &self.transaction;
-        // The covenant UTXO supplies the value spread across the outputs; summing them
-        // reproduces it and keeps the engine's inputs >= outputs check happy.
-        let utxo_value: u64 = tx.outputs.iter().map(|o| o.value).sum();
+        // The covenant UTXO's value, per the redeem's `verify_continuation_value` (`out0 == in0`).
+        // A permission output is settler-funded, so it is no part of the covenant's own value.
+        let utxo_value: u64 = tx.outputs[0].value;
         let utxo = UtxoEntry::new(
             utxo_value,
             pay_to_script_hash_script(&self.prev_redeem),
@@ -233,9 +229,9 @@ impl Settlement {
     /// - **No exits** (`permission_spk_hash == [0; 32]`): one continuation output (index 0)
     ///   carrying the full input value.
     /// - **Exits** (`permission_spk_hash != [0; 32]`): two covenant-bound outputs - index 0 the
-    ///   continuation (value `input.value - input.permission_output_value`), index 1 the permission
-    ///   exit (value `input.permission_output_value`, SPK
-    ///   `permission_spk(input.permission_spk_hash)`).
+    ///   continuation (value `input.value`, undrawn), index 1 the permission exit (value
+    ///   `input.permission_output_value`, SPK `permission_spk(input.permission_spk_hash)`), which
+    ///   the caller funds from its own inputs.
     pub fn build_dev(input: &SettlementDevInput<'_>) -> Self {
         let redeem_len =
             dev_redeem_script_len(input.prev_state, input.lane_key, input.permission_output_value);
@@ -267,16 +263,12 @@ impl Settlement {
                 Some(CovenantBinding::new(0, input.covenant_id)),
             )]
         } else {
-            // Exits present: split the covenant value between the continuation (output 0) and
-            // the permission exit (output 1). Order is load-bearing - the script reads output 1
-            // by index.
-            let continuation_value = input
-                .value
-                .checked_sub(input.permission_output_value)
-                .expect("covenant value must cover the permission output");
+            // Exits present: the continuation still carries the whole covenant value, and the
+            // permission exit is funded by the caller's own inputs alongside the fee. Order is
+            // load-bearing - the script reads output 1 by index.
             vec![
                 TransactionOutput::with_covenant(
-                    continuation_value,
+                    input.value,
                     pay_to_script_hash_script(&next_redeem),
                     Some(CovenantBinding::new(0, input.covenant_id)),
                 ),
@@ -534,7 +526,10 @@ mod tests {
         assert_eq!(settlement.transaction.outputs.len(), 2);
 
         let continuation = &settlement.transaction.outputs[0];
-        assert_eq!(continuation.value, value - DEFAULT_PERMISSION_OUTPUT_VALUE);
+        assert_eq!(
+            continuation.value, value,
+            "the exit is caller-funded, so the covenant carries forward undrawn",
+        );
         assert_eq!(
             continuation.script_public_key,
             pay_to_script_hash_script(&settlement.next_redeem),
@@ -593,28 +588,25 @@ mod tests {
         check_two_outputs(&settlement, value, &perm_hash);
     }
 
+    /// A covenant worth less than the permission output still settles an exit: the exit is funded
+    /// by the caller's own inputs, never drawn from the covenant, so the covenant's value places
+    /// no ceiling on the exits it can emit.
     #[test]
-    #[should_panic(expected = "covenant value must cover the permission output")]
-    fn settlement_tx_panics_when_value_below_permission_output_succinct() {
-        let input = make_input(
-            succinct_pins(),
-            succinct_witness(),
-            DEFAULT_PERMISSION_OUTPUT_VALUE - 1,
-            &[0x77; 32],
-        );
-        let _ = Settlement::build(&input);
+    fn settlement_tx_emits_an_exit_from_a_covenant_smaller_than_it_succinct() {
+        let value = DEFAULT_PERMISSION_OUTPUT_VALUE - 1;
+        let perm_hash = [0x77u8; 32];
+        let input = make_input(succinct_pins(), succinct_witness(), value, &perm_hash);
+        let settlement = Settlement::build(&input);
+        check_two_outputs(&settlement, value, &perm_hash);
     }
 
     #[test]
-    #[should_panic(expected = "covenant value must cover the permission output")]
-    fn settlement_tx_panics_when_value_below_permission_output_groth16() {
-        let input = make_input(
-            groth16_pins(),
-            groth16_witness(),
-            DEFAULT_PERMISSION_OUTPUT_VALUE - 1,
-            &[0x77; 32],
-        );
-        let _ = Settlement::build(&input);
+    fn settlement_tx_emits_an_exit_from_a_covenant_smaller_than_it_groth16() {
+        let value = DEFAULT_PERMISSION_OUTPUT_VALUE - 1;
+        let perm_hash = [0x77u8; 32];
+        let input = make_input(groth16_pins(), groth16_witness(), value, &perm_hash);
+        let settlement = Settlement::build(&input);
+        check_two_outputs(&settlement, value, &perm_hash);
     }
 
     #[test]
@@ -683,7 +675,7 @@ fn delegate_entry_spk_hash(covenant_id: &Hash) -> [u8; 32] {
 /// `verify_outputs_and_append_perm_hash`, sharing the `verify_continuation_value`,
 /// `verify_permission_output_value`, and `extract_and_match_permission_spk` helpers. The dev path
 /// exercises BOTH branches: the count==1 tests cover the no-exits continuation-value check, and
-/// the count==2 (`dev_exits_*`) tests cover the exits layout - the continuation-value split, the
+/// the count==2 (`dev_exits_*`) tests cover the exits layout - the undrawn continuation value, the
 /// permission-output-value pin, and the permission-SPK rebuild/match. The production count==2
 /// branch differs only in appending the extracted hash to its journal preimage; that journal /
 /// proof path requires a real seal (CUDA-only) and is out of scope for a host dev-mode test.
@@ -751,8 +743,7 @@ mod engine_value_spend_tests {
         Settlement::build_dev(&input)
     }
 
-    /// Dev settlement in the count==2 (exits) layout: a non-zero `permission_spk_hash` and a
-    /// covenant value large enough to cover the permission-exit split.
+    /// Dev settlement in the count==2 (exits) layout, from a non-zero `permission_spk_hash`.
     fn dev_settlement_with_exits() -> Settlement {
         let value = 10 * DEFAULT_PERMISSION_OUTPUT_VALUE;
         let input = SettlementDevInput {
@@ -879,17 +870,14 @@ mod engine_value_spend_tests {
     }
 
     /// Positive: the honest two-output (count==2) dev settlement passes the engine. Exercises
-    /// the count==2 branch end to end - continuation value split, permission-output-value pin,
+    /// the count==2 branch end to end - undrawn continuation value, permission-output-value pin,
     /// and permission-SPK rebuild/match.
     #[test]
     fn dev_exits_honest_two_outputs_verify() {
         let settlement = dev_settlement_with_exits();
         let value = 10 * DEFAULT_PERMISSION_OUTPUT_VALUE;
         assert_eq!(settlement.transaction.outputs.len(), 2);
-        assert_eq!(
-            settlement.transaction.outputs[0].value,
-            value - DEFAULT_PERMISSION_OUTPUT_VALUE,
-        );
+        assert_eq!(settlement.transaction.outputs[0].value, value);
         assert_eq!(settlement.transaction.outputs[1].value, DEFAULT_PERMISSION_OUTPUT_VALUE);
         run_engine(&settlement.transaction, &settlement.prev_redeem, value, &accessor())
             .expect("honest two-output settlement must verify");
@@ -897,8 +885,8 @@ mod engine_value_spend_tests {
 
     /// Malleation rejection: keep the sig_script and both covenant outputs' SPKs / bindings,
     /// shrink output 0's value and divert the freed value to a fresh non-covenant attacker
-    /// output (keeping inputs >= outputs balanced). The count==2 `out0 == in0 - perm` check
-    /// must reject this.
+    /// output (keeping inputs >= outputs balanced). The count==2 `out0 == in0` check must reject
+    /// this.
     #[test]
     fn dev_exits_malleated_continuation_rejected() {
         let settlement = dev_settlement_with_exits();
@@ -1110,7 +1098,8 @@ mod engine_deposit_binding_tests {
     /// string (`VerifyError` is what a failed `OpEqualVerify` produces).
     fn run(settlement: &Settlement) -> Result<(), String> {
         let tx = &settlement.transaction;
-        let utxo_value: u64 = tx.outputs.iter().map(|o| o.value).sum();
+        // The covenant input's value, per `verify_continuation_value`'s `out0 == in0`.
+        let utxo_value: u64 = tx.outputs[0].value;
         let utxo = UtxoEntry::new(
             utxo_value,
             pay_to_script_hash_script(&settlement.prev_redeem),

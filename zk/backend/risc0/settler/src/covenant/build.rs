@@ -173,8 +173,7 @@ pub fn build_settlement(
 
 /// Builds a dev settlement for one proven bundle against the live dev covenant `cov`.
 ///
-/// Panics if the artifact does not chain from `cov` or carries L2-to-L1 exits, which the dev redeem
-/// does not support.
+/// Panics if the artifact does not chain from `cov`.
 pub fn build_dev_settlement(
     lane_key: &Hash,
     cov: &CovenantState,
@@ -193,11 +192,6 @@ pub fn build_dev_settlement(
         cov.covenant_id,
         "dev settlement covenant_id must match the live covenant",
     );
-    assert_eq!(
-        artifact.permission_spk_hash, [0u8; 32],
-        "this dev settlement builder does not wire permission exits through the artifact yet",
-    );
-
     let settlement = Settlement::build_dev(&SettlementDevInput {
         deposit_spk_hash: &artifact.deposit_spk_hash,
         covenant_id: cov.covenant_id,
@@ -210,7 +204,7 @@ pub fn build_dev_settlement(
         claimed_seq_commit: artifact.new_seq_commit,
         prev_outpoint: cov.outpoint,
         value: cov.value,
-        permission_spk_hash: &[0u8; 32],
+        permission_spk_hash: &artifact.permission_spk_hash,
         permission_output_value: DEFAULT_PERMISSION_OUTPUT_VALUE,
     });
     let continuation_spk = pay_to_script_hash_script(&settlement.next_redeem);

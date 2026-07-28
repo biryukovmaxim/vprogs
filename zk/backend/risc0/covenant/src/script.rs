@@ -52,9 +52,9 @@ use kaspa_txscript::{
         Op0, Op2Dup, OpAdd, OpBlake2b, OpCat, OpChainblockSeqCommit, OpCovOutputCount,
         OpCovOutputIdx, OpData32, OpDiv, OpDrop, OpDup, OpElse, OpEndIf, OpEqual, OpEqualVerify,
         OpFromAltStack, OpIf, OpInputCovenantId, OpMul, OpNot, OpNumEqual, OpNumEqualVerify, OpRot,
-        OpSHA256, OpSize, OpSub, OpSubstr, OpSwap, OpToAltStack, OpTrue, OpTxInputAmount,
-        OpTxInputIndex, OpTxInputScriptSigLen, OpTxInputScriptSigSubstr, OpTxOutputAmount,
-        OpTxOutputSpk, OpTxOutputSpkSubstr, OpVerify, OpZkPrecompile,
+        OpSHA256, OpSize, OpSubstr, OpSwap, OpToAltStack, OpTrue, OpTxInputAmount, OpTxInputIndex,
+        OpTxInputScriptSigLen, OpTxInputScriptSigSubstr, OpTxOutputAmount, OpTxOutputSpk,
+        OpTxOutputSpkSubstr, OpVerify, OpZkPrecompile,
     },
     script_builder::ScriptBuilder,
     zk_precompiles::tags::ZkTag,
@@ -316,9 +316,9 @@ pub fn build_dev_redeem_script(
 ///
 /// Reads `OpCovOutputCount` and branches:
 /// - `count == 2`: pins both covenant outputs to tx-output indices 0 and 1, enforces
-///   `outputs[0].value == input[0].value - permission_output_value` and `outputs[1].value ==
-///   permission_output_value`, rejects the `[0; 32]` permission-hash sentinel, and rebuilds +
-///   matches the permission P2SH SPK on output 1.
+///   `outputs[0].value == input[0].value` and `outputs[1].value == permission_output_value`,
+///   rejects the `[0; 32]` permission-hash sentinel, and rebuilds + matches the permission P2SH SPK
+///   on output 1. The permission output is funded by the settler, not by the covenant.
 /// - `count == 1`: pins the sole covenant output to tx-output index 0 and enforces full
 ///   carry-forward (`outputs[0].value == input[0].value`).
 /// - any other count: fails.
@@ -344,7 +344,7 @@ fn verify_dev_outputs(b: &mut ScriptBuilder, permission_output_value: u64) {
         verify_cov_output_at_idx(b, 0, 0);
         verify_cov_output_at_idx(b, 1, 1);
 
-        verify_continuation_value(b, permission_output_value);
+        verify_continuation_value(b);
         verify_permission_output_value(b, permission_output_value);
         extract_and_match_permission_spk(b);
         // The extracted hash is unused in dev (no journal to append it to).
@@ -357,7 +357,7 @@ fn verify_dev_outputs(b: &mut ScriptBuilder, permission_output_value: u64) {
         b.add_op(OpNumEqualVerify).unwrap();
 
         verify_cov_output_at_idx(b, 0, 0);
-        verify_continuation_value(b, 0);
+        verify_continuation_value(b);
     }
     b.add_op(OpEndIf).unwrap();
 }
@@ -779,8 +779,8 @@ fn verify_outputs_and_append_perm_hash(b: &mut ScriptBuilder, pins: &RedeemPins<
         verify_cov_output_at_idx(b, 0, 0);
         verify_cov_output_at_idx(b, 1, 1);
 
-        // ---- enforce output[0].value == input[0].value - permission_output_value ----
-        verify_continuation_value(b, pins.common().permission_output_value);
+        // ---- enforce output[0].value == input[0].value (the exit is settler-funded) ----
+        verify_continuation_value(b);
 
         // ---- enforce output[1].value == pins.permission_output_value ----
         verify_permission_output_value(b, pins.common().permission_output_value);
@@ -807,7 +807,7 @@ fn verify_outputs_and_append_perm_hash(b: &mut ScriptBuilder, pins: &RedeemPins<
         verify_cov_output_at_idx(b, 0, 0);
 
         // ---- enforce output[0].value == input[0].value (full carry-forward) ----
-        verify_continuation_value(b, 0);
+        verify_continuation_value(b);
 
         b.add_data(&[0u8; 32]).unwrap();
         b.add_op(OpCat).unwrap();
@@ -897,30 +897,25 @@ fn verify_cov_output_at_idx(b: &mut ScriptBuilder, k: i64, expected_idx: i64) {
     b.add_op(OpEqualVerify).unwrap();
 }
 
-/// Pins the continuation output's value (tx-output index 0) to the covenant input's value
-/// (input index 0) minus `perm_value`. With `perm_value == 0` this is strict carry-forward of
-/// the full covenant value; with `perm_value == permission_output_value` it accounts for the
-/// permission-exit output split off in the count==2 case.
+/// Pins the continuation output's value (tx-output index 0) to the covenant input's value (input
+/// index 0): strict carry-forward of the whole covenant value, in both the count==1 and count==2
+/// cases.
+///
+/// The permission-exit output does not come out of the covenant. It is funded by the settler's own
+/// schnorr-signed inputs alongside the fee, so a covenant paying repeated exits never drains and
+/// its value is invariant across settlements.
 ///
 /// Consensus covenant tracking is index-only (it conserves no value across a covenant's inputs
 /// and outputs), and input 0 carries no signature, so without this the continuation output's
 /// amount is unconstrained: an attacker can shrink output 0 and divert the freed value to a
-/// non-covenant output while every other invariant still passes. The strict equality (fees come
-/// from a separate schnorr-signed funding input, never from the covenant value) is the on-chain
-/// mirror of the builder's `input.value - permission_output_value` (see
-/// `Settlement::build`; `checked_sub` there computes exactly the same quantity).
-fn verify_continuation_value(b: &mut ScriptBuilder, perm_value: u64) {
+/// non-covenant output while every other invariant still passes.
+fn verify_continuation_value(b: &mut ScriptBuilder) {
     b.add_i64(0).unwrap();
     b.add_op(OpTxInputAmount).unwrap();
     // Stack: [..., in0_value]
-    if perm_value != 0 {
-        b.add_i64(perm_value as i64).unwrap();
-        b.add_op(OpSub).unwrap();
-        // Stack: [..., in0_value - perm_value]
-    }
     b.add_i64(0).unwrap();
     b.add_op(OpTxOutputAmount).unwrap();
-    // Stack: [..., expected_out0_value, out0_value]
+    // Stack: [..., in0_value, out0_value]
     b.add_op(OpNumEqualVerify).unwrap();
 }
 

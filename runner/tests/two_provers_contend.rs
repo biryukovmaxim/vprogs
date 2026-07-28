@@ -31,12 +31,13 @@ use vprogs_core_atomics::AtomicAsyncLatch;
 use vprogs_core_smt::EMPTY_HASH;
 use vprogs_core_test_utils::ResourceIdExt;
 use vprogs_core_types::{AccessMetadata, ResourceId};
-use vprogs_example_tn10_flow::daemon::{
-    self, BridgeObservers, BridgeParams, Elfs, FlowNode, ProvingParams,
-};
 use vprogs_l1_types::{L1TransactionCovenantExt, SettlementInfo};
 use vprogs_l1_wallet::encode_activity_payload;
 use vprogs_node_test_utils::L1Node;
+use vprogs_runner::{
+    BridgeObservers, BridgeParams, Elfs, ProvingParams, RunnerNode, RunnerStore, SettlementQueue,
+    build_proving_node,
+};
 use vprogs_zk_backend_risc0_api::{Backend, ProofType};
 use vprogs_zk_backend_risc0_settler::{
     AlternationPacer, CovenantState, SettlementMode, SettlementWorkerConfig, dev_bootstrap_redeem,
@@ -85,12 +86,12 @@ const LANE_FINALITY_DEPTH: u64 = 10;
 const FUND_VALUE: u64 = 100_000_000;
 const FUND_COUNT: usize = 6;
 
-/// Per-prover wiring kept alive for the duration of the run. Dropping the [`FlowNode`] tears the
+/// Per-prover wiring kept alive for the duration of the run. Dropping the [`RunnerNode`] tears the
 /// prover's bridge and pipeline down, so the test holds both for the whole driver loop.
 struct Prover {
     /// The proving node (bridge + pipeline). Explicitly shut down at teardown so its worker, and
     /// the RocksDB store it holds, is released before `_db_dir` is reclaimed.
-    node: FlowNode,
+    node: RunnerNode,
     /// The settler task. Awaited at the end; `Ok(())` proves it did not panic on a competitor.
     settler: tokio::task::JoinHandle<()>,
     /// Latch the test opens to tear the settler down gracefully.
@@ -178,7 +179,7 @@ async fn two_provers_contend() {
     let tx_elf = transaction_processor_elf();
     let batch_elf = batch_processor_elf();
     let aggregator_elf = batch_aggregator_elf();
-    let elfs = Elfs { transaction: &tx_elf, batch: &batch_elf, aggregator: &aggregator_elf };
+    let elfs = Elfs { program: &tx_elf, batch: &batch_elf, aggregator: &aggregator_elf };
     let params = Params::from(network_id);
     let pacer = Arc::new(AlternationPacer::new());
 
@@ -452,7 +453,7 @@ async fn two_provers_reform_superseded_suffix() {
     let tx_elf = transaction_processor_elf();
     let batch_elf = batch_processor_elf();
     let aggregator_elf = batch_aggregator_elf();
-    let elfs = Elfs { transaction: &tx_elf, batch: &batch_elf, aggregator: &aggregator_elf };
+    let elfs = Elfs { program: &tx_elf, batch: &batch_elf, aggregator: &aggregator_elf };
     let params = Params::from(network_id);
     let pacer = Arc::new(AlternationPacer::new());
 
@@ -501,7 +502,13 @@ async fn two_provers_reform_superseded_suffix() {
     // re-aggregation.
     const DRIVER_ITERS: usize = 8;
     const CARRIERS_PER_RANGE: usize = 5;
-    for i in 0..DRIVER_ITERS {
+    // Settlements the contended ranges must land before the drain begins.
+    const MIN_PRE_DRAIN_SETTLEMENTS: usize = 3;
+    // Iteration ceiling. Dev proving runs on the CPU and trails the driver on a loaded host, so
+    // past `DRIVER_ITERS` the loop keeps driving ranges until the chain catches up.
+    const MAX_DRIVER_ITERS: usize = 40;
+    let mut pre_drain_len = 0;
+    for i in 0..MAX_DRIVER_ITERS {
         for _ in 0..CARRIERS_PER_RANGE {
             let payload = encode_activity_payload(
                 &[AccessMetadata::write(ResourceId::for_test(1))],
@@ -519,20 +526,25 @@ async fn two_provers_reform_superseded_suffix() {
             l1.mine_blocks(1).await;
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
+
+        // Settlements landed so far; suffixes proved past this length may still be in flight,
+        // superseded and awaiting re-aggregation against the adopted tip.
+        pre_drain_len =
+            covenant_chain(&l1, block_deploy, bootstrap_outpoint, covenant_id).await.len();
         if i % 4 == 0 {
-            let len =
-                covenant_chain(&l1, block_deploy, bootstrap_outpoint, covenant_id).await.len();
-            eprintln!("reform driver: iteration {i}/{DRIVER_ITERS}, covenant chain length {len}");
+            eprintln!(
+                "reform driver: iteration {i}/{MAX_DRIVER_ITERS}, covenant chain length \
+                 {pre_drain_len}",
+            );
+        }
+        if i + 1 >= DRIVER_ITERS && pre_drain_len >= MIN_PRE_DRAIN_SETTLEMENTS {
+            break;
         }
     }
-
-    // Pre-drain chain length: residual suffixes proved past here may still be in flight, superseded
-    // and awaiting re-aggregation against the adopted tip.
-    let pre_drain_len =
-        covenant_chain(&l1, block_deploy, bootstrap_outpoint, covenant_id).await.len();
     assert!(
-        pre_drain_len >= 3,
-        "the two provers must land >=3 settlements under contention before the drain, got {pre_drain_len}",
+        pre_drain_len >= MIN_PRE_DRAIN_SETTLEMENTS,
+        "the two provers must land >={MIN_PRE_DRAIN_SETTLEMENTS} settlements under contention \
+         before the drain, got {pre_drain_len}",
     );
 
     // === Step 5: acceptance-only drain - NO fresh ranges ===
@@ -675,7 +687,7 @@ async fn prover_catches_up_to_existing_covenant() {
     let tx_elf = transaction_processor_elf();
     let batch_elf = batch_processor_elf();
     let aggregator_elf = batch_aggregator_elf();
-    let elfs = Elfs { transaction: &tx_elf, batch: &batch_elf, aggregator: &aggregator_elf };
+    let elfs = Elfs { program: &tx_elf, batch: &batch_elf, aggregator: &aggregator_elf };
     let params = Params::from(network_id);
     let pacer = Arc::new(AlternationPacer::new());
 
@@ -898,7 +910,7 @@ async fn prover_catches_up_to_already_settled_covenant() {
     let tx_elf = transaction_processor_elf();
     let batch_elf = batch_processor_elf();
     let aggregator_elf = batch_aggregator_elf();
-    let elfs = Elfs { transaction: &tx_elf, batch: &batch_elf, aggregator: &aggregator_elf };
+    let elfs = Elfs { program: &tx_elf, batch: &batch_elf, aggregator: &aggregator_elf };
     let params = Params::from(network_id);
 
     // === Step 3: prover A settles ALONE until the bootstrap is well spent ===
@@ -1116,7 +1128,7 @@ async fn prover_resumes_after_settlement() {
     let tx_elf = transaction_processor_elf();
     let batch_elf = batch_processor_elf();
     let aggregator_elf = batch_aggregator_elf();
-    let elfs = Elfs { transaction: &tx_elf, batch: &batch_elf, aggregator: &aggregator_elf };
+    let elfs = Elfs { program: &tx_elf, batch: &batch_elf, aggregator: &aggregator_elf };
     let params = Params::from(network_id);
 
     // === Run 1: A lands at least one settlement, spending the bootstrap UTXO ===
@@ -1301,7 +1313,7 @@ async fn prover_resumes_after_settlement_contended() {
     let tx_elf = transaction_processor_elf();
     let batch_elf = batch_processor_elf();
     let aggregator_elf = batch_aggregator_elf();
-    let elfs = Elfs { transaction: &tx_elf, batch: &batch_elf, aggregator: &aggregator_elf };
+    let elfs = Elfs { program: &tx_elf, batch: &batch_elf, aggregator: &aggregator_elf };
     let params = Params::from(network_id);
     let pacer = Arc::new(AlternationPacer::new());
 
@@ -1514,7 +1526,7 @@ fn prover_address(keypair: &Keypair, network_id: NetworkId) -> Address {
     Address::new(Prefix::from(network_id.network_type()), Version::PubKey, &xonly.serialize())
 }
 
-/// Builds, wires, and starts one prover: a proving [`FlowNode`] over a fresh store + wRPC client,
+/// Builds, wires, and starts one prover: a proving [`RunnerNode`] over a fresh store + wRPC client,
 /// and a spawned settler draining the node's settlement queue against the shared covenant. Returns
 /// the assembled [`Prover`] (node kept alive, settler handle + shutdown latch for teardown).
 #[allow(clippy::too_many_arguments)]
@@ -1539,14 +1551,14 @@ async fn spawn_prover(
     let client_for_settler = connect_wrpc(&wrpc_url, network_id).await;
 
     let db_dir = TempDir::new().expect("temp dir");
-    let store = daemon::Store::open(db_dir.path());
+    let store = RunnerStore::open(db_dir.path());
 
-    let queue = daemon::FlowSettlementQueue::new();
+    let queue = SettlementQueue::new();
     // Each prover follows the same L1 through its own bridge, so each gets its own live settlement
     // channel: the bridge (writer) publishes settlements it observes (including the competitor's),
     // and this prover's settler (reader) reconciles against them.
     let (settlement_tx, settlement_rx) = watch::channel(None::<SettlementInfo>);
-    let node = daemon::build_proving_node(
+    let node = build_proving_node(
         elfs,
         store,
         BridgeParams {
@@ -1561,6 +1573,9 @@ async fn spawn_prover(
         },
         ProvingParams {
             covenant_id,
+            // The counter `transaction-processor` credits no L1 deposits, so every batch carries
+            // the no-deposit sentinel.
+            deposit_spk_hash: [0u8; 32],
             lane_key,
             client: client_for_lane,
             sink: queue.clone(),
@@ -1574,7 +1589,7 @@ async fn spawn_prover(
 
     // Backend is required by the settler config; in Dev mode it pins no image ids but the type is
     // still threaded through.
-    let backend = Backend::new(elfs.transaction, elfs.batch, elfs.aggregator, ProofType::Succinct);
+    let backend = Backend::new(elfs.program, elfs.batch, elfs.aggregator, ProofType::Succinct);
     let shutdown = AtomicAsyncLatch::new();
     let settler = tokio::spawn(run_settlement_worker(
         queue,

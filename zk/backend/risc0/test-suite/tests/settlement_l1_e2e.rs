@@ -321,10 +321,10 @@ async fn settlement_lands_in_real_block_dev_redeem() {
 
 /// Dev-mode L1 settlement WITH exits: drives the count==2 (two-output) dev settlement through the
 /// full simnet pipeline so the permission-exit output lands in a real block and passes the dev
-/// redeem's count==2 branch on chain (continuation value split, permission-output value, and
+/// redeem's count==2 branch on chain (undrawn continuation value, permission-output value, and
 /// permission-P2SH rebuild/match). The `permission_spk_hash` is a real
 /// [`PermissionTreeAccumulator`] commitment, so this exercises the permission tree's
-/// on-chain/off-chain hash agreement (issue #78) end to end alongside the value split (issue #76).
+/// on-chain/off-chain hash agreement (issue #78) end to end alongside the value checks (issue #76).
 /// Runs only under `RISC0_DEV_MODE=1`, same rationale as
 /// [`settlement_lands_in_real_block_dev_redeem`].
 #[tokio::test(flavor = "multi_thread")]
@@ -491,11 +491,12 @@ async fn run_one_dev_settlement(step: DevSettlementStep<'_>) -> DevSettlementOut
         label,
     } = step;
 
-    // Value the continuation output carries forward: the full covenant value on the single-output
-    // path, or that minus the permission-exit split when this settlement commits exits.
+    // The continuation carries the full covenant value on both paths: a permission exit is funded
+    // by the settling wallet's own inputs (`prepare_settlement_transaction` below pulls in the
+    // extra value alongside the fee), never drawn from the covenant.
     let perm_value =
         if permission_spk_hash == [0u8; 32] { 0 } else { DEFAULT_PERMISSION_OUTPUT_VALUE };
-    let continuation_value = COVENANT_VALUE - perm_value;
+    let continuation_value = COVENANT_VALUE;
 
     // === a. mine the carrier tx ===
     let carrier_payload = Vec::new().tap_mut(|p| {
@@ -554,7 +555,7 @@ async fn run_one_dev_settlement(step: DevSettlementStep<'_>) -> DevSettlementOut
         assert_eq!(outputs.len(), 1, "{label}: no-exit dev settlement must have one output");
     } else {
         assert_eq!(outputs.len(), 2, "{label}: dev settlement with exits must have two outputs");
-        assert_eq!(outputs[0].value, continuation_value, "{label}: continuation value split");
+        assert_eq!(outputs[0].value, continuation_value, "{label}: continuation carries undrawn");
         assert_eq!(outputs[1].value, perm_value, "{label}: permission-exit value");
         // Wire SPK layout: version(2) | OpBlake2b | OpData32 | hash(32) | OpEqual; .script() drops
         // the version, so script()[2..34] is the committed permission-tree hash.

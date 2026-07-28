@@ -204,7 +204,7 @@ pub(super) fn settlement_shape(params: &Params) -> BuiltShape {
         settlement_tx: settlement_skeleton(
             &covenant_spk,
             covenant_id,
-            covenant_value - PERMISSION_OUTPUT_VALUE,
+            covenant_value,
             &address,
             2_000,
         ),
