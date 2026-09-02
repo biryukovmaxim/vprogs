@@ -9265,6 +9265,7 @@ dependencies = [
  "vprogs-zk-abi",
  "vprogs-zk-batch-prover",
  "vprogs-zk-transaction-prover",
+ "zerocopy",
 ]
 
 [[package]]
