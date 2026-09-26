@@ -208,8 +208,8 @@ mod tests {
         let rate = 500.0;
         let (tx, entry) = carrier(params, FeePolicy::TargetFeerate(rate), 1_000_000_000);
 
-        let paid = fee_paid(&tx, &[entry.clone()]);
-        assert_eq!(paid, target_fee_mirror(params, rate, &tx, &[entry.clone()]));
+        let paid = fee_paid(&tx, std::slice::from_ref(&entry));
+        assert_eq!(paid, target_fee_mirror(params, rate, &tx, std::slice::from_ref(&entry)));
         assert!(paid > min_fee(params, &tx), "target fee {paid} must out-bid the floor");
         assert!(paid as f64 / priority_mass_mirror(params, &tx, &[entry]) as f64 >= rate);
     }

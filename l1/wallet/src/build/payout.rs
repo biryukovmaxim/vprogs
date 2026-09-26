@@ -157,12 +157,12 @@ mod tests {
             })
             .expect("fundable with a generous candidate")
         };
-        let floor_fee = fee_paid(&build(FeePolicy::Floor), &[entry.clone()]);
+        let floor_fee = fee_paid(&build(FeePolicy::Floor), std::slice::from_ref(&entry));
         let tx = build(FeePolicy::TargetFeerate(rate));
 
-        let paid = fee_paid(&tx, &[entry.clone()]);
+        let paid = fee_paid(&tx, std::slice::from_ref(&entry));
         assert!(paid > floor_fee, "target fee {paid} must out-bid the floor fee {floor_fee}");
-        assert_eq!(paid, target_fee_mirror(params, rate, &tx, &[entry.clone()]));
+        assert_eq!(paid, target_fee_mirror(params, rate, &tx, std::slice::from_ref(&entry)));
         assert!(paid as f64 / priority_mass_mirror(params, &tx, &[entry]) as f64 >= rate);
     }
 }
