@@ -145,9 +145,8 @@ pub struct ProvingParams {
     /// Receiver on the bridge's covenant `last_settlement` watch, cloned for the aggregate prover
     /// so it re-aggregates a superseded suffix, or `None` to run without re-forming.
     pub settlement_rx: Option<watch::Receiver<Option<SettlementInfo>>>,
-    /// Bundle journal the aggregate prover records each proved bundle into. The caller shares the
-    /// same handle with the settlement worker, whose supersede deletes must be visible to the
-    /// prover's resume path.
+    /// Bundle journal the aggregate prover records each proved bundle into, shared with the
+    /// settlement worker so its supersede deletes are visible to the prover's resume path.
     pub journal: Arc<dyn SettlementJournal>,
     /// Sender on the exit-leaf channel driving client Merkle-path proof generation, or `None` if
     /// exit publishing is disabled.

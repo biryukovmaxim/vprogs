@@ -63,7 +63,7 @@ fn reconcile<R>(
 /// rejection also fires while the competitor's settlement only sits in the mempool, where it can
 /// still be evicted or reorged and the range must stay queued, while an outpoint spent in a chain
 /// block cannot revert. `liveness` reads the covenant outpoint the bundle chains from, captured
-/// by the caller BEFORE this call's adoption (a post-adoption `cov` names the competitor's
+/// by the caller before this call's adoption (a post-adoption `cov` names the competitor's
 /// still-unspent continuation); it is injected as a closure so the resolution is testable
 /// without a node.
 async fn resolve_superseded<R, L, Fut>(

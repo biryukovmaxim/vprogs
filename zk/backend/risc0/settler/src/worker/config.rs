@@ -46,9 +46,9 @@ pub struct SettlementWorkerConfig {
     pub settlement: watch::Receiver<Option<SettlementInfo>>,
     /// Optional millisecond window to jitter each submission by, or `None` to submit immediately.
     pub submit_jitter: Option<Range<u64>>,
-    /// Aggregate-prover bundle journal. When present, a bundle the chain has superseded is deleted
-    /// from the journal at its start key on the skip path, so the aggregate prover's resume stops
-    /// re-feeding the same superseded bundle. `None` leaves every skip un-resolved.
+    /// Aggregate-prover bundle journal a chain-superseded bundle is deleted from at its start key
+    /// on the skip path (see the worker's supersede resolution), or `None` to leave every skip
+    /// un-resolved.
     pub journal: Option<Arc<dyn SettlementJournal>>,
     /// Test-only alternation: `(this settler's id, pacer shared with the competitor)`.
     #[cfg(feature = "test-utils")]
