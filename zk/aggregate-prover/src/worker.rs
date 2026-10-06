@@ -65,22 +65,30 @@ enum GapOutcome {
 
 /// Rolls an uncoverable committed gap back to its last coverable boundary.
 ///
-/// A kill between a batch's commit and its prove leaves durable metadata above the journal tail
-/// with no resolvable receipt, and nothing ever re-schedules a committed batch: the committed-gap
-/// pass composes cached receipts only, so the range would stay uncovered forever while every
-/// later bundle chains from a base the covenant never took and the settler skips it. Re-proving
-/// in place is impossible (the batch prover's inputs derive from the caller-supplied transaction
-/// list, which only the bridge re-feed re-supplies), so recovery reverts the persisted executor
-/// state to the last boundary whose batches do resolve: the bridge then re-feeds the range above
-/// it, which re-executes, re-commits, and re-proves those batches with fresh receipts, settling
-/// ahead of new work.
+/// A kill between a batch's commit and its prove leaves durable metadata with no resolvable
+/// receipt, and nothing ever re-schedules a committed batch: the committed-gap pass composes
+/// cached receipts only, so the range would stay uncovered forever while every later bundle
+/// chains from a base the covenant never took and the settler skips it. Re-proving in place is
+/// impossible (the batch prover's inputs derive from the caller-supplied transaction list, which
+/// only the bridge re-feed re-supplies), so recovery reverts the persisted executor state to the
+/// last boundary whose batches do resolve: the bridge then re-feeds the range above it, which
+/// re-executes, re-commits, and re-proves those batches with fresh receipts, settling ahead of
+/// new work.
 ///
-/// The walk starts from the highest durable boundary: the journal tail when entries survive,
-/// the settled boundary the committed-gap pass persists when they have all compacted away (an
-/// empty journal cannot itself tell "nothing ever settled" from "settled and compacted"), and
-/// the pruning root as the hard floor: nothing below the root is recoverable, and nothing above
-/// it is ever pruned, so the walk only stops at a genuine miss however deep the committed range
-/// runs above the boundary.
+/// The walk starts from the pruning root, raised by the settled boundary the committed-gap pass
+/// persists when the on-chain tip maps to a batch. The journal tail is deliberately NOT a
+/// boundary: a wedged run keeps proving new batches above the gap and journalling bundles that
+/// chain across it, so the tail can sit far above the gap and an interior miss below the first
+/// entry. Nothing below the root is recoverable and nothing above it is ever pruned, so the walk
+/// only stops at a genuine miss however deep the committed range runs; a normal restart walks
+/// the whole root-to-tip span, finds every receipt, and rolls nothing back. The persisted
+/// boundary is trusted only while the journal holds no entry at or below it (entries above the
+/// settled tip are unsettled by definition), which is what a boundary recorded from a journal
+/// tail that chained across a gap would contradict.
+///
+/// Journal entries extending above the rollback target are dropped with the rollback: their
+/// bundles chain from re-executed state the covenant never took, and the settler would skip
+/// them forever.
 ///
 /// Must run at startup, before any scheduler, bridge, or prover operates on `state`. Returns the
 /// boundary index rolled back to, or `None` when every committed batch above the boundary is
@@ -91,8 +99,11 @@ pub fn rollback_uncoverable_gap<S: Store, P: Processor<S>>(
     journal: &StoreJournal<S>,
     batch_image_id: &[u8; 32],
 ) -> Option<u64> {
-    let tail_end = journal.entries().last().map_or(0, |(_, entry)| entry.end_index);
-    let floor = tail_end.max(journal.settled_boundary().unwrap_or(0)).max(state.root().index());
+    let entries = journal.entries();
+    let settled = journal
+        .settled_boundary()
+        .filter(|boundary| entries.first().is_none_or(|(start, _)| start > boundary));
+    let floor = settled.unwrap_or(0).max(state.root().index());
     let (committed_tip, _) = journal.committed_tip()?;
     if committed_tip <= floor {
         return None;
@@ -128,10 +139,18 @@ pub fn rollback_uncoverable_gap<S: Store, P: Processor<S>>(
     let target = boundary?;
     match rollback_persisted_to(state, target) {
         Ok(_) => {
+            // Entries above the target chain across the now-reverted range; the re-feed and
+            // re-prove re-record them from the recovered state.
+            let stale = entries.iter().filter(|(_, entry)| entry.end_index > target).count();
+            for (start, entry) in &entries {
+                if entry.end_index > target {
+                    journal.delete(*start);
+                }
+            }
             log::warn!(
                 "aggregate-prover: committed batches above checkpoint {target} lack resolvable \
-                 receipts; rolled the executor back to it so the bridge re-feed re-executes and \
-                 re-proves the range"
+                 receipts; rolled the executor back to it and dropped {stale} journal entries \
+                 above it so the bridge re-feed re-executes and re-proves the range"
             );
             Some(target)
         }
@@ -997,15 +1016,19 @@ where
         // journal entry cannot resolve it, because every entry ends at or below the tail.
         let boundary = match tip {
             Some(tip) => {
-                let resolved = journal
-                    .checkpoint_of_block(tip.block_prove_to, committed_tip, tail_end + 1)
-                    .map_or(tail_end, |index| index.max(tail_end));
-                // Persist the settled boundary before the entries' compaction loses it: the
-                // startup recovery's walk floor needs it once every entry at or below the tip
-                // has settled away and the journal reads empty. The absent marker already says
-                // "nothing settled", so the no-tip arm records nothing.
-                journal.record_settled_boundary(resolved);
-                resolved
+                match journal.checkpoint_of_block(tip.block_prove_to, committed_tip, tail_end + 1) {
+                    // Persist the settled boundary before the entries' compaction loses it: the
+                    // startup recovery's walk floor needs it once every entry at or below the
+                    // tip has settled away and the journal reads empty. Only a mapped tip
+                    // checkpoint is recorded: an unmapped boundary (the tip sits below the
+                    // journal's span, e.g. entries chaining across an interior gap) would
+                    // record the tail as settled and poison every later walk.
+                    Some(index) => {
+                        journal.record_settled_boundary(index);
+                        index
+                    }
+                    None => tail_end,
+                }
             }
             None => tail_end,
         };

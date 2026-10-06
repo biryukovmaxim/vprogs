@@ -357,6 +357,70 @@ fn committed_gap_with_consumed_journal_recovers() {
     }
 }
 
+/// Tests the same recovery when a wedged run kept proving new batches above the gap and
+/// journalled bundles chaining across it: the journal tail then sits far above the interior gap
+/// and must not be trusted as the walk's boundary, and the entries above the gap must be
+/// dropped with the rollback (their bundles chain from state the covenant never took, so the
+/// settler would skip them forever). The persisted settled boundary is distrusted while the
+/// journal holds an entry at or below it, which is exactly the poisoned shape a boundary
+/// recorded from such a tail would leave behind.
+#[test]
+fn committed_gap_with_entries_chained_across_recovers() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    {
+        // The pre-restart half: block 1 settled, block 2 committed without its receipt (the
+        // gap), block 3 proved above the gap with a journalled bundle chaining across it, and a
+        // settled boundary recorded at that tail (the poisoned marker).
+        let storage: RocksDbStore = RocksDbStore::open(temp_dir.path());
+        let journal = StoreJournal::new(storage.clone());
+        let mut scheduler = Scheduler::new(
+            ExecutionConfig::default().with_processor(PlainProcessor),
+            StorageConfig::default().with_store(storage.clone()),
+        );
+        commit_batch_with_receipt(&mut scheduler, block(1, 0));
+        let lost = scheduler.schedule(block(2, 1), vec![lane_tx()]);
+        lost.wait_committed_blocking();
+        commit_batch_with_receipt(&mut scheduler, block(3, 2));
+        journal.record(
+            3,
+            &JournalEntry {
+                end_index: 3,
+                from_block: block_hash(3),
+                block_prove_to: block_hash(3),
+                seq_commit: seq_commit(),
+            },
+        );
+        journal.record_settled_boundary(3);
+        scheduler.shutdown();
+
+        let state = SchedulerState::new(StorageConfig::default().with_store(storage.clone()));
+        assert_eq!(
+            rollback_uncoverable_gap(&state, &journal, &BATCH_IMAGE_ID),
+            Some(1),
+            "the journal tail and its poisoned marker are distrusted; the floor resolves from \
+             the pruning root and the interior gap still bounds the rollback",
+        );
+        assert_eq!(
+            journal.committed_tip().map(|(index, _)| index),
+            Some(1),
+            "the metadata rows above the boundary are reverted with the rollback",
+        );
+        assert!(
+            journal.entries().iter().all(|(_, entry)| entry.end_index <= 1),
+            "the entries chaining across the gap are dropped with the rollback",
+        );
+        assert_eq!(journal.settled_boundary(), Some(3), "the poisoned marker is left as-is");
+
+        restart_refeed_and_settle(
+            &state,
+            &journal,
+            ("the startup pass re-records the settled boundary from the mapped tip", || {
+                journal.settled_boundary() == Some(1)
+            }),
+        );
+    }
+}
+
 /// Runs the restarted half both recovery tests share: builds the scheduler and worker over the
 /// rolled-back state, re-feeds the recovered range as the bridge would (commits and fresh
 /// receipts, no submit yet), releases the worker's startup gate with the settled tip and waits
