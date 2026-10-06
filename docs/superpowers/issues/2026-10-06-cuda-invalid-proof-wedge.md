@@ -126,3 +126,41 @@ stubbed off) and green in debug and release.
   reads against the bridge's first re-fed commit and predates this fix.
 - A KIP-21 lane purge that crosses the gap leaves `PruningConflict` and no recovery; the
   reactivation-proof work that unblocks those ranges is separate.
+- The worker's startup gate consumes the settlement watch's change flag only when it actually
+  parks on it; when the tip predates the worker's first gate poll (easy under test load, near
+  impossible in production, where the worker spawns before the bridge), the first main-loop
+  iteration treats the baseline republication as an advance and the resume advance pass
+  re-feeds the just-recorded covering entry once. The settler's supersede path absorbs the
+  duplicate; the recovery tests pin order and coverage rather than exact bundle counts.
+
+## Postscript: the empty-journal boundary (2026-10-06 14:34 UTC)
+
+The first live acceptance run on the wedged gpu store exposed a hole in the shipped recovery.
+That store had already been restarted once before the fix existed, and that restart's resume
+pass had deleted the journal entry the on-chain tip covered, so the journal read empty at the
+fixed node's startup: the recovery's tail defaulted to 0, the walk probed checkpoint 1 (long
+pruned below the committed frontier), took the absent metadata for the uncoverable boundary,
+and refused the rollback to checkpoint 0 with `PruningConflict`. The settled boundary
+(1881877) was known only to the worker's tip scan, which runs after the recovery seam.
+
+The fix makes the walk's floor durable and structural rather than journal-dependent:
+
+- The floor is the highest of the journal tail, the persisted settled boundary, and the
+  pruning root. Nothing below the root is recoverable and nothing above it is ever pruned
+  (metadata and receipts alike), so a walk from the root only ever stops at a genuine miss,
+  however deep the committed range runs above the boundary (the live store's executor kept
+  committing new batches above the wedge during startup sync).
+- The settled boundary is persisted (StateMetadata key) by the committed-gap pass whenever
+  the on-chain tip resolves one, so it survives the entry deletions that empty the journal
+  and raises the floor above the root for stores whose receipts miss on an image-id change
+  (where a root-floor walk would over-roll below the settled tip and the settler would skip
+  everything re-formed from there).
+- Metadata holes are skipped rather than counted as misses: a reorg-canceled batch keeps its
+  checkpoint id but never commits metadata, so the row set carries interior holes above the
+  root, and the first hole would otherwise masquerade as the wedge.
+
+With this, the wedged store recovers on the first restart: the walk from the root finds every
+settled batch above it coverable, stops at batch 1881878's missing receipt, and rolls the
+executor back to 1881877. The consumed-journal restart (journal already emptied by a prior
+resume, no marker yet) is pinned by a second test alongside the original; both run green in
+debug and release.
