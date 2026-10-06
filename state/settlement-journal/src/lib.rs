@@ -8,6 +8,7 @@
 use borsh::{BorshDeserialize, BorshSerialize};
 use kaspa_hashes::Hash;
 use vprogs_l1_types::ChainBlockMetadata;
+use vprogs_state_metadata::StateMetadata;
 use vprogs_storage_types::{StateSpace, Store, WriteBatch};
 
 /// One proved-but-unsettled bundle: the geometry needed to reload its aggregate receipt and
@@ -107,6 +108,24 @@ impl<S: Store> StoreJournal<S> {
     /// Returns whether any entry is recorded.
     pub fn has_entries(&self) -> bool {
         !self.entries().is_empty()
+    }
+
+    /// Returns the highest checkpoint whose bundle has settled, or `None` when no worker has
+    /// observed a settlement.
+    ///
+    /// Entries compact away as settlements land, so this boundary (not the last surviving
+    /// entry) is what an empty journal still owes a reader: it separates "nothing ever settled"
+    /// from "settled and compacted".
+    pub fn settled_boundary(&self) -> Option<u64> {
+        StateMetadata::settled_boundary(&self.store)
+    }
+
+    /// Records the settled boundary, committing it immediately so a kill right after a
+    /// settlement cannot lose it.
+    pub fn record_settled_boundary(&self, index: u64) {
+        let mut wb = self.store.write_batch();
+        StateMetadata::set_settled_boundary(&mut wb, index);
+        self.store.commit(wb);
     }
 }
 

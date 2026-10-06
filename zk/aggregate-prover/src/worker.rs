@@ -75,30 +75,40 @@ enum GapOutcome {
 /// it, which re-executes, re-commits, and re-proves those batches with fresh receipts, settling
 /// ahead of new work.
 ///
+/// The walk starts from the highest durable boundary: the journal tail when entries survive,
+/// the settled boundary the committed-gap pass persists when they have all compacted away (an
+/// empty journal cannot itself tell "nothing ever settled" from "settled and compacted"), and
+/// the pruning root as the hard floor: nothing below the root is recoverable, and nothing above
+/// it is ever pruned, so the walk only stops at a genuine miss however deep the committed range
+/// runs above the boundary.
+///
 /// Must run at startup, before any scheduler, bridge, or prover operates on `state`. Returns the
-/// boundary index rolled back to, or `None` when every committed batch above the journal tail is
+/// boundary index rolled back to, or `None` when every committed batch above the boundary is
 /// coverable (the normal restart: the committed-gap pass composes it), when nothing is committed
-/// past the tail, or when the rollback cannot run (pruning advanced past the boundary).
+/// past it, or when the rollback cannot run (pruning advanced past the boundary).
 pub fn rollback_uncoverable_gap<S: Store, P: Processor<S>>(
     state: &SchedulerState<S, P>,
     journal: &StoreJournal<S>,
     batch_image_id: &[u8; 32],
 ) -> Option<u64> {
     let tail_end = journal.entries().last().map_or(0, |(_, entry)| entry.end_index);
+    let floor = tail_end.max(journal.settled_boundary().unwrap_or(0)).max(state.root().index());
     let (committed_tip, _) = journal.committed_tip()?;
-    if committed_tip <= tail_end {
+    if committed_tip <= floor {
         return None;
     }
-    // The first batch above the journal tail whose metadata or cached receipt cannot be resolved
-    // bounds the uncoverable range. The same non-empty heuristic the committed-gap pass applies
-    // (an empty batch composes no receipt) keeps empty batches coverable as-is. The presence
-    // probe reads the store directly rather than round-tripping the read worker a receipt
-    // handle would need to await.
+    // The first batch above the boundary whose cached receipt cannot be resolved bounds the
+    // uncoverable range. The same non-empty heuristic the committed-gap pass applies (an empty
+    // batch composes no receipt) keeps empty batches coverable as-is, and a metadata hole is
+    // skipped rather than counted a miss: a reorg-canceled batch keeps its checkpoint id but
+    // never commits metadata, so the row set carries interior holes however far above the root
+    // it runs. The presence probe reads the store directly rather than round-tripping the read
+    // worker a receipt handle would need to await.
     let mut boundary = None;
-    for index in tail_end + 1..=committed_tip {
+    let mut last_present = floor;
+    for index in floor + 1..=committed_tip {
         let Some(metadata) = journal.batch_metadata(index) else {
-            boundary = Some(index - 1);
-            break;
+            continue;
         };
         if metadata.lane_tip != metadata.prev_lane_tip {
             let key = BatchKey {
@@ -109,18 +119,19 @@ pub fn rollback_uncoverable_gap<S: Store, P: Processor<S>>(
             let receipt_stored =
                 state.storage().store().get(StateSpace::ProofReceipt, key.as_bytes());
             if receipt_stored.is_none() {
-                boundary = Some(index - 1);
+                boundary = Some(last_present);
                 break;
             }
         }
+        last_present = index;
     }
     let target = boundary?;
     match rollback_persisted_to(state, target) {
         Ok(_) => {
             log::warn!(
-                "aggregate-prover: committed batches above the journal tail lack resolvable \
-                 receipts; rolled the executor back to checkpoint {target} so the bridge re-feed \
-                 re-executes and re-proves the range"
+                "aggregate-prover: committed batches above checkpoint {target} lack resolvable \
+                 receipts; rolled the executor back to it so the bridge re-feed re-executes and \
+                 re-proves the range"
             );
             Some(target)
         }
@@ -985,9 +996,17 @@ where
         // The boundary search covers only the gap range strictly above the journal tail; a
         // journal entry cannot resolve it, because every entry ends at or below the tail.
         let boundary = match tip {
-            Some(tip) => journal
-                .checkpoint_of_block(tip.block_prove_to, committed_tip, tail_end + 1)
-                .map_or(tail_end, |index| index.max(tail_end)),
+            Some(tip) => {
+                let resolved = journal
+                    .checkpoint_of_block(tip.block_prove_to, committed_tip, tail_end + 1)
+                    .map_or(tail_end, |index| index.max(tail_end));
+                // Persist the settled boundary before the entries' compaction loses it: the
+                // startup recovery's walk floor needs it once every entry at or below the tip
+                // has settled away and the journal reads empty. The absent marker already says
+                // "nothing settled", so the no-tip arm records nothing.
+                journal.record_settled_boundary(resolved);
+                resolved
+            }
             None => tail_end,
         };
         // The on-chain tip already covers the whole range; new work chains from it directly.

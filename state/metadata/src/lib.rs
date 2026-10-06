@@ -7,6 +7,8 @@ mod keys {
     pub const ROOT: &[u8] = b"root";
     /// Key for the last committed batch (index + metadata stored together).
     pub const LAST_COMMITTED: &[u8] = b"last_committed";
+    /// Key for the settled boundary (highest checkpoint whose bundle has settled; bare index).
+    pub const SETTLED_BOUNDARY: &[u8] = b"settled_boundary";
 }
 
 /// Provides type-safe operations for the Metadata column family.
@@ -63,6 +65,33 @@ impl StateMetadata {
             StateSpace::Metadata,
             keys::LAST_COMMITTED,
             &borsh::to_vec(checkpoint).expect("failed to serialize Checkpoint"),
+        );
+    }
+
+    /// Returns the highest checkpoint whose bundle has settled, or `None` when no worker has
+    /// observed a settlement.
+    ///
+    /// Settlement-journal entries compact away as settlements land, so an empty journal cannot
+    /// distinguish "nothing ever settled" from "settled and compacted"; this boundary preserves
+    /// that knowledge across the deletions.
+    pub fn settled_boundary<S>(store: &S) -> Option<u64>
+    where
+        S: ReadStore,
+    {
+        store
+            .get(StateSpace::Metadata, keys::SETTLED_BOUNDARY)
+            .map(|bytes| borsh::from_slice(&bytes).expect("corrupted store: unrecoverable"))
+    }
+
+    /// Sets the settled boundary.
+    pub fn set_settled_boundary<W>(wb: &mut W, index: u64)
+    where
+        W: WriteBatch,
+    {
+        wb.put(
+            StateSpace::Metadata,
+            keys::SETTLED_BOUNDARY,
+            &borsh::to_vec(&index).expect("failed to serialize boundary index"),
         );
     }
 }

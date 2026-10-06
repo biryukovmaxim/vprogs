@@ -5,10 +5,11 @@ name              = "vprogs-state-settlement-journal"
 version.workspace = true
 
 [dependencies]
-borsh.workspace                = true
-kaspa-hashes.workspace         = true
-vprogs-l1-types.workspace      = true
-vprogs-storage-types.workspace = true
+borsh.workspace                 = true
+kaspa-hashes.workspace          = true
+vprogs-l1-types.workspace       = true
+vprogs-state-metadata.workspace = true
+vprogs-storage-types.workspace  = true
 
 [dev-dependencies]
 tempfile.workspace                     = true

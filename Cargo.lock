@@ -9015,6 +9015,7 @@ dependencies = [
  "tempfile",
  "vprogs-l1-types",
  "vprogs-state-batch-metadata",
+ "vprogs-state-metadata",
  "vprogs-storage-rocksdb-store",
  "vprogs-storage-types",
 ]

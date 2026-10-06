@@ -299,85 +299,165 @@ fn committed_gap_with_lost_receipt_rolls_back_and_refeeds() {
         assert!(journal.batch_metadata(3).is_none(), "block 3's stale row is gone");
         assert_eq!(state.last_committed().index(), 1, "last_committed sits at the tail");
 
-        // The scheduler and worker start over the rolled-back state, exactly as the node builds
-        // them after the recovery call. The worker parks at its startup gate until the bridge
-        // (this test, through the settlement watch) publishes the covenant's last settlement.
-        let mut scheduler = Scheduler::with_state(
-            ExecutionConfig::default().with_processor(PlainProcessor),
-            state.clone(),
+        restart_refeed_and_settle(
+            &state,
+            &journal,
+            ("the resume pass drops the settled tail entry", || {
+                !journal.entries().iter().any(|(start, _)| *start == 1)
+            }),
         );
-        let settlement_queue: AsyncQueue<ScheduledBundle<SettlementArtifact<Vec<u8>>>> =
-            AsyncQueue::new();
-        let (settlement_tx, settlement_rx) = watch::channel::<Option<SettlementInfo>>(None);
-        let prover = AggregateProver::new(
-            SyntheticBackend,
-            state.receipt_store(),
-            Some(journal.clone()),
-            AggregateProverConfig {
-                lane_key: Hash::default(),
-                covenant_id: None,
-                lane_source: ServeLaneProofs,
-                settlement_queue: Some(settlement_queue.clone()),
-                settlement: Some(settlement_rx),
-                bundle_size: 1..=1,
-                exits: None,
-            },
-        );
+    }
+}
 
-        // The bridge re-feeds blocks 2 and 3: they re-execute, re-commit at their reoccupied
-        // checkpoint indexes, and re-prove (the fresh receipt standing in for the lost one). No
-        // submit yet, so the worker stays parked at its gate.
-        let two = commit_batch_with_receipt(&mut scheduler, block(2, 1));
-        let three = commit_batch_with_receipt(&mut scheduler, block(3, 2));
+/// Tests the same recovery when a prior restart already consumed the journal: its resume pass
+/// deleted the tail entry the on-chain tip covered, so the journal reads empty at this restart
+/// and the settled boundary survives only where the worker persisted it (the pruning root stands
+/// in before any worker has run). The lost-receipt batch is still found above that floor, the
+/// rollback still recovers on this restart, and the worker's startup pass re-records the boundary
+/// for the next one.
+#[test]
+fn committed_gap_with_consumed_journal_recovers() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    {
+        // The pre-restart half matches the lost-receipt setup except no journal entry survives:
+        // the settled bundle compacted away on the earlier restart.
+        let storage: RocksDbStore = RocksDbStore::open(temp_dir.path());
+        let journal = StoreJournal::new(storage.clone());
+        let mut scheduler = Scheduler::new(
+            ExecutionConfig::default().with_processor(PlainProcessor),
+            StorageConfig::default().with_store(storage.clone()),
+        );
+        commit_batch_with_receipt(&mut scheduler, block(1, 0));
+        let lost = scheduler.schedule(block(2, 1), vec![lane_tx()]);
+        lost.wait_committed_blocking();
+        commit_batch_with_receipt(&mut scheduler, block(3, 2));
+        scheduler.shutdown();
+
+        assert!(journal.entries().is_empty(), "test setup: the journal reads empty");
+        let state = SchedulerState::new(StorageConfig::default().with_store(storage.clone()));
+        assert_eq!(
+            rollback_uncoverable_gap(&state, &journal, &BATCH_IMAGE_ID),
+            Some(1),
+            "the floor resolves from the pruning root (no entry, no recorded boundary) and the \
+             lost receipt still bounds the gap",
+        );
         assert_eq!(
             journal.committed_tip().map(|(index, _)| index),
-            Some(3),
-            "the re-fed range re-commits through its top",
-        );
-        assert_eq!(state.last_committed().index(), 3, "the scheduler tracks the re-fed tip");
-
-        // The bridge's baseline tip releases the worker's gate: the resume pass drops the tail
-        // entry (the tip covers it) and the committed-gap pass composes the re-fed range, whose
-        // receipts are fresh again, into one covering bundle.
-        settlement_tx.send_replace(Some(tip_through(1)));
-        wait_until("the resume pass drops the settled tail entry", Duration::from_secs(10), || {
-            !journal.entries().iter().any(|(start, _)| *start == 1)
-        });
-
-        // The re-fed batches then join as live commands, and genuinely new work (block 4)
-        // arrives past the gap.
-        submit_live(&prover, &two);
-        submit_live(&prover, &three);
-        let four = commit_batch_with_receipt(&mut scheduler, block(4, 3));
-        submit_live(&prover, &four);
-
-        // The covering bundle settles first, then the re-fed batches' own live bundles, then
-        // block 4's: the recovered range settles ahead of new work, never behind it.
-        let mut spans = Vec::new();
-        for _ in 0..4 {
-            let bundle = next_bundle(&settlement_queue, Duration::from_secs(10))
-                .expect("the covering and new-work bundles must all settle");
-            bundle.wait_artifact_published_blocking();
-            assert!(bundle.artifact().is_some(), "every bundle carries a real artifact");
-            spans.push(bundle.block_prove_to());
-        }
-        assert_eq!(
-            spans,
-            vec![block_hash(3), block_hash(2), block_hash(3), block_hash(4)],
-            "the covered gap settles first, the new work last",
-        );
-        assert!(
-            next_bundle(&settlement_queue, Duration::from_millis(500)).is_none(),
-            "no further handle may arrive",
+            Some(1),
+            "the metadata rows above the boundary are reverted with the rollback",
         );
 
-        // The journal ends with one contiguous record per re-fed and new checkpoint above the
-        // tail: the live bundles' records replace the covering bundle's span, leaving no gap.
-        let recorded: Vec<(u64, u64)> =
-            journal.entries().into_iter().map(|(start, entry)| (start, entry.end_index)).collect();
-        assert_eq!(recorded, vec![(2, 2), (3, 3), (4, 4)], "no gap may remain in the journal");
-
-        prover.shutdown();
-        scheduler.shutdown();
+        restart_refeed_and_settle(
+            &state,
+            &journal,
+            ("the startup pass records the settled boundary", || {
+                journal.settled_boundary() == Some(1)
+            }),
+        );
     }
+}
+
+/// Runs the restarted half both recovery tests share: builds the scheduler and worker over the
+/// rolled-back state, re-feeds the recovered range as the bridge would (commits and fresh
+/// receipts, no submit yet), releases the worker's startup gate with the settled tip and waits
+/// for `startup_done`, then feeds the re-fed batches plus genuinely new work as live commands.
+/// Asserts the recovered range settles ahead of the new work, the boundary marker is recorded,
+/// and the journal ends with one contiguous record per checkpoint above the boundary.
+fn restart_refeed_and_settle(
+    state: &SchedulerState<RocksDbStore, PlainProcessor>,
+    journal: &StoreJournal<RocksDbStore>,
+    startup_done: (&str, impl Fn() -> bool),
+) {
+    // The scheduler and worker start over the rolled-back state, exactly as the node builds
+    // them after the recovery call. The worker parks at its startup gate until the bridge
+    // (this test, through the settlement watch) publishes the covenant's last settlement.
+    let mut scheduler = Scheduler::with_state(
+        ExecutionConfig::default().with_processor(PlainProcessor),
+        state.clone(),
+    );
+    let settlement_queue: AsyncQueue<ScheduledBundle<SettlementArtifact<Vec<u8>>>> =
+        AsyncQueue::new();
+    let (settlement_tx, settlement_rx) = watch::channel::<Option<SettlementInfo>>(None);
+    let prover = AggregateProver::new(
+        SyntheticBackend,
+        state.receipt_store(),
+        Some(journal.clone()),
+        AggregateProverConfig {
+            lane_key: Hash::default(),
+            covenant_id: None,
+            lane_source: ServeLaneProofs,
+            settlement_queue: Some(settlement_queue.clone()),
+            settlement: Some(settlement_rx),
+            bundle_size: 1..=1,
+            exits: None,
+        },
+    );
+
+    // The bridge re-feeds blocks 2 and 3: they re-execute, re-commit at their reoccupied
+    // checkpoint indexes, and re-prove (the fresh receipt standing in for the lost one). No
+    // submit yet, so the worker stays parked at its gate.
+    let two = commit_batch_with_receipt(&mut scheduler, block(2, 1));
+    let three = commit_batch_with_receipt(&mut scheduler, block(3, 2));
+    assert_eq!(
+        journal.committed_tip().map(|(index, _)| index),
+        Some(3),
+        "the re-fed range re-commits through its top",
+    );
+    assert_eq!(state.last_committed().index(), 3, "the scheduler tracks the re-fed tip");
+
+    // The bridge's baseline tip releases the worker's gate: the resume pass acts on the journal
+    // and the committed-gap pass composes the re-fed range, whose receipts are fresh again,
+    // into one covering bundle.
+    settlement_tx.send_replace(Some(tip_through(1)));
+    let (desc, pred) = startup_done;
+    wait_until(desc, Duration::from_secs(10), pred);
+    // The marker lands in the committed-gap pass, just past whatever `startup_done` observed,
+    // so wait it out rather than assert it mid-flight.
+    wait_until("the settled boundary is recorded", Duration::from_secs(10), || {
+        journal.settled_boundary() == Some(1)
+    });
+
+    // The re-fed batches then join as live commands, and genuinely new work (block 4)
+    // arrives past the gap.
+    submit_live(&prover, &two);
+    submit_live(&prover, &three);
+    let four = commit_batch_with_receipt(&mut scheduler, block(4, 3));
+    submit_live(&prover, &four);
+
+    // The covering bundle settles first and block 4's new-work bundle last: the recovered range
+    // settles ahead of new work, never behind it. A republication race can re-feed the covering
+    // entry once more (the worker's gate consumes the settlement change only when it actually
+    // parks; when the tip predates the worker's first gate poll, the first loop iteration
+    // re-runs the resume advance pass over the just-recorded gap entry), so the order and the
+    // coverage are pinned rather than the exact partitioning.
+    let mut spans = Vec::new();
+    loop {
+        let timeout =
+            if spans.len() < 4 { Duration::from_secs(10) } else { Duration::from_millis(500) };
+        let Some(bundle) = next_bundle(&settlement_queue, timeout) else { break };
+        bundle.wait_artifact_published_blocking();
+        assert!(bundle.artifact().is_some(), "every bundle carries a real artifact");
+        spans.push(bundle.block_prove_to());
+        assert!(
+            spans.len() <= 5,
+            "at most the covering bundles plus the live work may arrive (got {spans:?})",
+        );
+    }
+    assert!(spans.len() >= 4, "the covering and new-work bundles must all settle");
+    assert_eq!(spans.first(), Some(&block_hash(3)), "the covered gap settles first");
+    assert_eq!(spans.last(), Some(&block_hash(4)), "the new work settles last");
+    assert!(spans.contains(&block_hash(2)), "the re-fed range's own bundle settles");
+    assert!(
+        spans.iter().all(|hash| [block_hash(2), block_hash(3), block_hash(4)].contains(hash)),
+        "no bundle may prove outside the recovered range and the new work (got {spans:?})",
+    );
+
+    // The journal ends with one contiguous record per re-fed and new checkpoint above the
+    // boundary: the live bundles' records replace the covering bundle's span, leaving no gap.
+    let recorded: Vec<(u64, u64)> =
+        journal.entries().into_iter().map(|(start, entry)| (start, entry.end_index)).collect();
+    assert_eq!(recorded, vec![(2, 2), (3, 3), (4, 4)], "no gap may remain in the journal");
+
+    prover.shutdown();
+    scheduler.shutdown();
 }
