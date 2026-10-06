@@ -368,10 +368,8 @@ impl<S: Store, P: Processor<S>> ChainSink<P::BatchMetadata, P::Transaction> for 
 /// `target_index`, which re-executes and re-commits it with fresh receipts. Unlike
 /// [`Scheduler::rollback_to`] there is no live scheduler here, so there are no in-flight batches
 /// to cancel and no processor to notify; the call must therefore happen before the node builds
-/// either. The revert runs through the state's own storage manager (repointing the persisted
-/// latest pointers via the stored rollback pointers), and the batch-metadata rows above the
-/// target are deleted so the committed frontier matches `last_committed` and the re-fed blocks
-/// reoccupy their checkpoint indexes.
+/// either. The batch-metadata rows above the target are deleted, so `committed_tip()` reads
+/// the boundary and the re-fed blocks reoccupy their checkpoint indexes.
 ///
 /// Returns the target checkpoint, or [`SchedulerError::PruningConflict`] when pruning has
 /// advanced past the target: the rollback pointers are gone, and only re-proving the range
