@@ -164,3 +164,33 @@ settled batch above it coverable, stops at batch 1881878's missing receipt, and 
 executor back to 1881877. The consumed-journal restart (journal already emptied by a prior
 resume, no marker yet) is pinned by a second test alongside the original; both run green in
 debug and release.
+
+## Postscript 2: the journal tail is not a boundary (2026-10-06 15:26 UTC)
+
+The second deploy found the wedged store in a new shape: the wedged run had not been idle. Its
+live path kept proving new batches above the gap (per-batch proving works fine; only the gap
+range is unprovable), formed bundles across it, and recorded 31 journal entries spanning
+1952639..=1997644, all skipped by the settler as base mismatches. At the next restart the
+recovery's floor included the journal tail, so the floor sat above the committed tip, the walk
+range was empty, and the recovery returned without acting: the interior gap sat below the
+journal's first entry the whole time.
+
+Three corrections:
+
+- The floor no longer includes the journal tail. It is the pruning root raised by the persisted
+  settled boundary, and the boundary is trusted only while the journal holds no entry at or
+  below it (entries above the settled tip are unsettled by definition; a boundary sitting above
+  an entry contradicts it). The read-time guard also de-poisons this store: the deployed build's
+  gap pass had recorded the unmapped fallback (the journal tail) as the settled boundary, which
+  alone would have kept every later walk empty. The gap pass now records the boundary only when
+  the on-chain tip actually maps to a batch.
+- A normal restart now walks the whole root-to-tip span (receipts above the root always
+  resolve, so the walk returns without rolling anything back); only the cost grows, and it is
+  bounded by the pruning window.
+- The rollback drops journal entries extending above the target: their bundles chain from
+  re-executed state the covenant never took, and the settler would skip them forever. The
+  re-feed re-records them from the recovered state.
+
+A third test pins the exact shape: entries journalled above an interior receipt gap, a settled
+boundary recorded at that tail, restart, floor from the root, boundary at the gap, stale
+entries dropped, recovered range and new work settling in order.
