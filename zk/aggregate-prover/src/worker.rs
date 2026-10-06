@@ -13,12 +13,15 @@ use tokio::{
 use vprogs_core_atomics::AsyncQueue;
 use vprogs_core_codec::Reader;
 use vprogs_l1_types::{ChainBlockMetadata, SettlementInfo, TransactionId};
-use vprogs_scheduling_scheduler::{Processor, ScheduledBatch};
+use vprogs_scheduling_scheduler::{
+    Processor, ScheduledBatch, SchedulerState, rollback_persisted_to,
+};
 use vprogs_state_proof_receipt::{AggregatorKey, BatchKey, Prefix};
 use vprogs_state_settlement_journal::{JournalEntry, StoreJournal};
-use vprogs_storage_types::Store;
+use vprogs_storage_types::{StateSpace, Store};
 use vprogs_zk_abi::batch_aggregator::{Inputs as AggregatorInputs, StateTransition};
 use vprogs_zk_batch_prover::{LaneProofRequest, LaneProofSource};
+use zerocopy::IntoBytes;
 
 use crate::{
     AggregateProver, AggregateProverConfig, Backend, BundleBlocks, ExitsForBundle, ScheduledBundle,
@@ -58,6 +61,78 @@ enum GapOutcome {
     /// caller retries on later loop wakes, re-bounded to it so the retry never grows over
     /// batches committed after the restart (those belong to the live bundling path).
     Deferred(u64),
+}
+
+/// Rolls an uncoverable committed gap back to its last coverable boundary.
+///
+/// A kill between a batch's commit and its prove leaves durable metadata above the journal tail
+/// with no resolvable receipt, and nothing ever re-schedules a committed batch: the committed-gap
+/// pass composes cached receipts only, so the range would stay uncovered forever while every
+/// later bundle chains from a base the covenant never took and the settler skips it. Re-proving
+/// in place is impossible (the batch prover's inputs derive from the caller-supplied transaction
+/// list, which only the bridge re-feed re-supplies), so recovery reverts the persisted executor
+/// state to the last boundary whose batches do resolve: the bridge then re-feeds the range above
+/// it, which re-executes, re-commits, and re-proves those batches with fresh receipts, settling
+/// ahead of new work.
+///
+/// Must run at startup, before any scheduler, bridge, or prover operates on `state`. Returns the
+/// boundary index rolled back to, or `None` when every committed batch above the journal tail is
+/// coverable (the normal restart: the committed-gap pass composes it), when nothing is committed
+/// past the tail, or when the rollback cannot run (pruning advanced past the boundary).
+pub fn rollback_uncoverable_gap<S: Store, P: Processor<S>>(
+    state: &SchedulerState<S, P>,
+    journal: &StoreJournal<S>,
+    batch_image_id: &[u8; 32],
+) -> Option<u64> {
+    let tail_end = journal.entries().last().map_or(0, |(_, entry)| entry.end_index);
+    let (committed_tip, _) = journal.committed_tip()?;
+    if committed_tip <= tail_end {
+        return None;
+    }
+    // The first batch above the journal tail whose metadata or cached receipt cannot be resolved
+    // bounds the uncoverable range. The same non-empty heuristic the committed-gap pass applies
+    // (an empty batch composes no receipt) keeps empty batches coverable as-is. The presence
+    // probe reads the store directly rather than round-tripping the read worker a receipt
+    // handle would need to await.
+    let mut boundary = None;
+    for index in tail_end + 1..=committed_tip {
+        let Some(metadata) = journal.batch_metadata(index) else {
+            boundary = Some(index - 1);
+            break;
+        };
+        if metadata.lane_tip != metadata.prev_lane_tip {
+            let key = BatchKey {
+                prefix: Prefix { checkpoint_index: index.into() },
+                block_hash: metadata.hash.as_bytes(),
+                image_id: *batch_image_id,
+            };
+            let receipt_stored =
+                state.storage().store().get(StateSpace::ProofReceipt, key.as_bytes());
+            if receipt_stored.is_none() {
+                boundary = Some(index - 1);
+                break;
+            }
+        }
+    }
+    let target = boundary?;
+    match rollback_persisted_to(state, target) {
+        Ok(_) => {
+            log::warn!(
+                "aggregate-prover: committed batches above the journal tail lack resolvable \
+                 receipts; rolled the executor back to checkpoint {target} so the bridge re-feed \
+                 re-executes and re-proves the range"
+            );
+            Some(target)
+        }
+        Err(err) => {
+            log::error!(
+                "aggregate-prover: uncoverable committed gap above checkpoint {target} cannot \
+                 be rolled back ({err}); its range stays uncovered and no settlement will land \
+                 on it"
+            );
+            None
+        }
+    }
 }
 
 /// Background worker that accumulates scheduled batches, forms bundles from the consecutively-ready
@@ -965,7 +1040,9 @@ where
             log::error!(
                 "aggregate-prover: committed batch {miss} above the journal tail lacks its \
                  metadata or receipt; covering {covered} and leaving {miss}..={committed_tip} \
-                 uncovered"
+                 uncovered. The startup rollback \
+                 (rollback_uncoverable_gap) re-executes such a range, so a miss here means it \
+                 could not run or this raced a batch whose prove has not landed yet"
             );
         }
         // No real work below the miss: nothing to compose, matching the live no-op path.

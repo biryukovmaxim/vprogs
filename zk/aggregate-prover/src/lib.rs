@@ -13,3 +13,4 @@ pub use exit_feed::{ExitsForBundle, extract_bundle_exits};
 pub use prover::AggregateProver;
 pub use scheduled_bundle::{BundleBlocks, ScheduledBundle};
 pub use settlement_artifact::SettlementArtifact;
+pub use worker::rollback_uncoverable_gap;

@@ -33,7 +33,7 @@ pub(crate) use resource_access::ResourceAccess;
 pub use scheduled_batch::{ScheduledBatch, ScheduledBatchRef};
 pub use scheduled_transaction::ScheduledTransaction;
 pub(crate) use scheduled_transaction::ScheduledTransactionRef;
-pub use scheduler::Scheduler;
+pub use scheduler::{Scheduler, rollback_persisted_to};
 pub use state::SchedulerState;
 pub use state_diff::{StateDiff, StateDiffRef};
 pub use storage_cmd::{Read, ReadReceipt, ReceiptRead, ReceiptValue, StoreReceipt, Write};

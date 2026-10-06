@@ -32,9 +32,10 @@ use vprogs_storage_rocksdb_store::RocksDbStore;
 use vprogs_zk_abi::withdrawal::ExitLeaf;
 use vprogs_zk_aggregate_prover::{
     AggregateProverConfig, ExitsForBundle, ScheduledBundle, SettlementArtifact,
+    rollback_uncoverable_gap,
 };
 use vprogs_zk_backend_risc0_api::{Backend, ProofType, Receipt};
-use vprogs_zk_batch_prover::BatchProverConfig;
+use vprogs_zk_batch_prover::{Backend as _, BatchProverConfig};
 use vprogs_zk_vm::{ProvingPipeline, Vm};
 
 use crate::lane::RemoteLaneSource;
@@ -194,6 +195,16 @@ pub fn build_proving_node(
     // one storage manager: the prover's receipt store is derived from this state and must exist
     // before the prover.
     let state = SchedulerState::new(StorageConfig::default().with_store(store.clone()));
+    // Attach the indexer before recovery so the rollback's resource reverts feed it;
+    // Node::with_state re-attaches the same indexer below.
+    if let Some(indexer) = &indexer {
+        state.set_indexer(indexer.0.clone());
+    }
+    // Recover an uncoverable committed gap (a kill mid-prove: metadata durable, receipt lost)
+    // before anything runs over the state: roll the executor back to its last coverable boundary
+    // so the bridge re-feed re-executes and re-proves the range. A no-op when every committed
+    // batch above the journal tail is coverable, the normal restart.
+    rollback_uncoverable_gap(&state, &proving.journal, backend.batch_image_id());
     let pipeline = ProvingPipeline::aggregate(
         backend.clone(),
         store.clone(),

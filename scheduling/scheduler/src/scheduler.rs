@@ -9,7 +9,7 @@ use vprogs_scheduling_execution_workers::ExecutionWorkers;
 use vprogs_state_batch_metadata::BatchMetadata as StoredBatchMetadata;
 use vprogs_storage_canonical_chain::CanonicalChainManager;
 use vprogs_storage_manager::StorageConfig;
-use vprogs_storage_types::Store;
+use vprogs_storage_types::{StateSpace, Store};
 
 use crate::{
     BatchLifecycleWorker, CancellationContext, ExecutionConfig, PruningWorker, Read, Resource,
@@ -359,4 +359,80 @@ impl<S: Store, P: Processor<S>> ChainSink<P::BatchMetadata, P::Transaction> for 
     fn shutdown(self) {
         self.shutdown();
     }
+}
+
+/// Rolls the persisted executor state back to `target_index` before any scheduler runs over it.
+///
+/// The startup recovery path for an uncoverable committed gap (a batch committed durably but
+/// never proven): reverting the persisted state lets the bridge re-feed the range above
+/// `target_index`, which re-executes and re-commits it with fresh receipts. Unlike
+/// [`Scheduler::rollback_to`] there is no live scheduler here, so there are no in-flight batches
+/// to cancel and no processor to notify; the call must therefore happen before the node builds
+/// either. The revert runs through the state's own storage manager (repointing the persisted
+/// latest pointers via the stored rollback pointers), and the batch-metadata rows above the
+/// target are deleted so the committed frontier matches `last_committed` and the re-fed blocks
+/// reoccupy their checkpoint indexes.
+///
+/// Returns the target checkpoint, or [`SchedulerError::PruningConflict`] when pruning has
+/// advanced past the target: the rollback pointers are gone, and only re-proving the range
+/// could recover it.
+pub fn rollback_persisted_to<S: Store, P: Processor<S>>(
+    state: &SchedulerState<S, P>,
+    target_index: u64,
+) -> SchedulerResult<Checkpoint<P::BatchMetadata>> {
+    let upper_bound = state.last_processed().index();
+    if upper_bound <= target_index {
+        return Ok((*state.last_processed()).clone());
+    }
+    // Pruning past the target deletes the rollback pointers the revert walks; the same guard
+    // Scheduler::rollback_to gets from the pruning worker's pause.
+    if state.root().index() > target_index {
+        return Err(SchedulerError::PruningConflict);
+    }
+
+    // The snapshot must cover every batch being reverted, so rebuild the chain to the current
+    // committed tip. Scoped here so the manager releases the chain's sole-writer claim before
+    // the node's scheduler rebuilds its own.
+    let snapshot = {
+        let manager =
+            state.storage().store().canonical_chain_manager::<P::BatchMetadata>(upper_bound);
+        manager.chain().snapshot()
+    };
+
+    // Index 0 is the genesis state: no batch exists on disk for it.
+    let target = if target_index == 0 {
+        Checkpoint::default()
+    } else {
+        let store = &**state.storage().store();
+        Checkpoint::new(target_index, StoredBatchMetadata::get(store, target_index))
+    };
+    state.set_last_processed(Arc::new(target.clone()));
+
+    let done_signal = Default::default();
+    state.storage().submit_write(Write::Rollback(Rollback::new(
+        target.clone(),
+        upper_bound,
+        snapshot,
+        state.clone(),
+        &done_signal,
+    )));
+    done_signal.wait_blocking();
+
+    // Drop the metadata rows above the target: they are no longer committed, and leaving them
+    // would pin the committed frontier (and checkpoint id allocation) above the rollback point.
+    let store = &**state.storage().store();
+    let stale: Vec<u64> = store
+        .prefix_iter_rev(StateSpace::BatchMetadata, &[])
+        .map(|(key, _)| u64::from_be_bytes(key[..8].try_into().expect("corrupted batch index key")))
+        .take_while(|&index| index > target_index)
+        .collect();
+    if !stale.is_empty() {
+        let mut wb = store.write_batch();
+        for index in stale {
+            StoredBatchMetadata::delete(&mut wb, index);
+        }
+        store.commit(wb);
+    }
+
+    Ok(target)
 }
