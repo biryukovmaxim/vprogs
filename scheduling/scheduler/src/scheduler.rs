@@ -7,6 +7,7 @@ use tap::Tap;
 use vprogs_core_types::{ChainSink, Checkpoint, ResourceId, SchedulerTransaction};
 use vprogs_scheduling_execution_workers::ExecutionWorkers;
 use vprogs_state_batch_metadata::BatchMetadata as StoredBatchMetadata;
+use vprogs_state_proof_receipt::{Prefix, invalidate_checkpoint};
 use vprogs_storage_canonical_chain::CanonicalChainManager;
 use vprogs_storage_manager::StorageConfig;
 use vprogs_storage_types::{StateSpace, Store};
@@ -368,8 +369,10 @@ impl<S: Store, P: Processor<S>> ChainSink<P::BatchMetadata, P::Transaction> for 
 /// `target_index`, which re-executes and re-commits it with fresh receipts. Unlike
 /// [`Scheduler::rollback_to`] there is no live scheduler here, so there are no in-flight batches
 /// to cancel and no processor to notify; the call must therefore happen before the node builds
-/// either. The batch-metadata rows above the target are deleted, so `committed_tip()` reads
-/// the boundary and the re-fed blocks reoccupy their checkpoint indexes.
+/// either. The batch-metadata rows and cached receipts above the target are deleted, so
+/// `committed_tip()` reads the boundary, the re-fed blocks reoccupy their checkpoint indexes,
+/// and the re-covered range proves fresh instead of reusing receipts keyed under the reverted
+/// lineage.
 ///
 /// Returns the target checkpoint, or [`SchedulerError::PruningConflict`] when pruning has
 /// advanced past the target: the rollback pointers are gone, and only re-proving the range
@@ -418,19 +421,28 @@ pub fn rollback_persisted_to<S: Store, P: Processor<S>>(
 
     // Drop the metadata rows above the target: they are no longer committed, and leaving them
     // would pin the committed frontier (and checkpoint id allocation) above the rollback point.
+    // The cached receipts above the target go with them: their keys are checkpoint index +
+    // block hash + image id, so a block whose hash repeats between the reverted lineage and
+    // the re-execution hits the stale key and the re-cover would reuse a receipt proved under
+    // the reverted lineage's assumptions (the guest verifier rejects it deterministically).
+    // Invalidating forces the re-covered range to prove fresh from the live-derived batches,
+    // which cannot disagree with themselves.
     let store = &**state.storage().store();
     let stale: Vec<u64> = store
         .prefix_iter_rev(StateSpace::BatchMetadata, &[])
         .map(|(key, _)| u64::from_be_bytes(key[..8].try_into().expect("corrupted batch index key")))
         .take_while(|&index| index > target_index)
         .collect();
+    let mut wb = store.write_batch();
+    for index in target_index + 1..=upper_bound {
+        invalidate_checkpoint(store, &mut wb, &Prefix { checkpoint_index: index.into() });
+    }
     if !stale.is_empty() {
-        let mut wb = store.write_batch();
         for index in stale {
             StoredBatchMetadata::delete(&mut wb, index);
         }
-        store.commit(wb);
     }
+    store.commit(wb);
 
     Ok(target)
 }

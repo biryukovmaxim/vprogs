@@ -23,10 +23,11 @@ use vprogs_core_test_utils::ResourceIdExt;
 use vprogs_core_types::{AccessMetadata, ResourceId, SchedulerTransaction};
 use vprogs_l1_types::{ChainBlockMetadata, SettlementInfo};
 use vprogs_scheduling_scheduler::{ExecutionConfig, Scheduler, SchedulerState, TransactionContext};
-use vprogs_state_proof_receipt::{AggregatorKey, Prefix};
+use vprogs_state_proof_receipt::{AggregatorKey, BatchKey, Prefix};
 use vprogs_state_settlement_journal::{JournalEntry, StoreJournal};
 use vprogs_storage_manager::StorageConfig;
 use vprogs_storage_rocksdb_store::RocksDbStore;
+use vprogs_storage_types::{StateSpace, Store};
 use vprogs_zk_abi::{
     batch_aggregator::{StateTransition, StateTransitionArgs},
     batch_processor::{BatchTransition, BatchTransitionArgs},
@@ -36,6 +37,7 @@ use vprogs_zk_aggregate_prover::{
     rollback_uncoverable_gap,
 };
 use vprogs_zk_batch_prover::{LaneProofError, LaneProofRequest, LaneProofSource};
+use zerocopy::IntoBytes;
 
 /// Transaction-guest image id. This repro proves nothing real, so image ids only key receipt
 /// lookups.
@@ -906,6 +908,81 @@ fn committed_gap_with_poisoned_receipt_rolls_back() {
 
         // The re-feed re-executes the range with fresh, consistent receipts and settles ahead
         // of new work, exactly as the lost-receipt recovery does.
+        restart_refeed_and_settle(
+            &state,
+            &journal,
+            ("the resume pass drops the settled tail entry", || {
+                !journal.entries().iter().any(|(start, _)| *start == 1)
+            }),
+        );
+    }
+}
+
+/// Tests that the rollback invalidates cached receipts above its target: receipt keys are
+/// checkpoint index + block hash + image id, so when a block's hash repeats between the
+/// reverted lineage and the live re-execution, the stale key hits and the re-cover would reuse
+/// a receipt proved under the reverted lineage's per-resource assumptions, which the guest
+/// verifier rejects deterministically (the proving-thread death). After the rollback the range
+/// must prove fresh from the live-derived batches and settle in order.
+#[test]
+fn rollback_invalidates_cached_receipts_above_the_target() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    {
+        // The pre-restart half: block 1 settled and journaled, block 2 committed without its
+        // receipt (the policy's miss), block 3 committed WITH a receipt under exactly the key
+        // the re-execution of the same block would look up.
+        let storage: RocksDbStore = RocksDbStore::open(temp_dir.path());
+        let journal = StoreJournal::new(storage.clone());
+        let mut scheduler = Scheduler::new(
+            ExecutionConfig::default().with_processor(PlainProcessor),
+            StorageConfig::default().with_store(storage.clone()),
+        );
+        commit_batch_with_receipt(&mut scheduler, block(1, 0));
+        let lost = scheduler.schedule(block(2, 1), vec![lane_tx()]);
+        lost.wait_committed_blocking();
+        commit_batch_with_receipt(&mut scheduler, block(3, 2));
+        journal.record(
+            1,
+            &JournalEntry {
+                end_index: 1,
+                from_block: block_hash(1),
+                block_prove_to: block_hash(1),
+                seq_commit: seq_commit(),
+            },
+        );
+        scheduler.shutdown();
+
+        // The stale receipt resolves before the rollback, under the very key the re-fed block
+        // 3 will look up again.
+        let stale_key = |index: u64, hash: u8| BatchKey {
+            prefix: Prefix { checkpoint_index: index.into() },
+            block_hash: block_hash(hash).as_bytes(),
+            image_id: BATCH_IMAGE_ID,
+        };
+        assert!(
+            storage.get(StateSpace::ProofReceipt, stale_key(3, 3).as_bytes()).is_some(),
+            "test setup: the stale receipt is cached under the re-execution's key",
+        );
+
+        // The rollback lands below the miss and invalidates everything above it.
+        let state = SchedulerState::<RocksDbStore, PlainProcessor>::new(
+            StorageConfig::default().with_store(storage.clone()),
+        );
+        assert_eq!(
+            rollback_uncoverable_gap(&state, &journal, &BATCH_IMAGE_ID),
+            Some(1),
+            "the missing receipt at block 2 bounds the rollback",
+        );
+        assert!(
+            storage
+                .get(vprogs_storage_types::StateSpace::ProofReceipt, stale_key(3, 3).as_bytes())
+                .is_none(),
+            "receipts above the target are invalidated with the metadata, so the re-covered \
+             range proves fresh instead of reusing the reverted lineage's receipt",
+        );
+
+        // The re-fed blocks re-commit at their reoccupied indexes with fresh receipts and the
+        // recovered range settles ahead of new work.
         restart_refeed_and_settle(
             &state,
             &journal,
