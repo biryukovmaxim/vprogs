@@ -23,6 +23,7 @@ use vprogs_core_test_utils::ResourceIdExt;
 use vprogs_core_types::{AccessMetadata, ResourceId, SchedulerTransaction};
 use vprogs_l1_types::{ChainBlockMetadata, SettlementInfo};
 use vprogs_scheduling_scheduler::{ExecutionConfig, Scheduler, SchedulerState, TransactionContext};
+use vprogs_state_proof_receipt::{AggregatorKey, Prefix};
 use vprogs_state_settlement_journal::{JournalEntry, StoreJournal};
 use vprogs_storage_manager::StorageConfig;
 use vprogs_storage_rocksdb_store::RocksDbStore;
@@ -524,4 +525,260 @@ fn restart_refeed_and_settle(
 
     prover.shutdown();
     scheduler.shutdown();
+}
+
+/// Encodes the settlement journal of a bundle that chains from a base the covenant never took:
+/// identical to [`settlement_journal`] except its proven `prev_state`, so the resume pass's
+/// tip-pins check rejects it.
+fn stale_settlement_journal() -> Vec<u8> {
+    let mut buf = Vec::new();
+    StateTransition::encode(
+        &mut buf,
+        StateTransitionArgs {
+            prev_state: &[0xAA; 32],
+            prev_lane_tip: &Hash::default(),
+            new_state: &[0x11; 32],
+            new_lane_tip: &Hash::default(),
+            new_seq_commit: &seq_commit(),
+            covenant_id: &[0u8; 32],
+            tx_image_id: &TX_IMAGE_ID,
+            batch_image_id: &BATCH_IMAGE_ID,
+            permission_spk_hash: &[0u8; 32],
+            deposit_spk_hash: &[0u8; 32],
+            lane_key: &Hash::default(),
+        },
+    );
+    buf
+}
+
+/// Tests that a journal entry left by a settlement that died without landing (its proven
+/// transition chains from a base the covenant never took) is dropped by the resume pass rather
+/// than re-fed forever, and the committed-gap pass re-covers the range as one fresh bundle
+/// chaining from the on-chain tip. Re-feeding the dead entry instead wedges the settler: every
+/// bundle re-folds from the stale base, the settler skips it as a base mismatch, and the entry
+/// never resolves.
+#[test]
+fn committed_gap_with_dead_settlement_entry_recovers() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    {
+        // The pre-restart half: block 1 settled, blocks 2 and 3 proved above it, and one journal
+        // entry recorded above the settled tip whose receipt chains from a base the covenant
+        // never took (the shape a dead settlement leaves behind: the bundle below it never
+        // landed, so it chains from that bundle's end state, not the on-chain tip).
+        let storage: RocksDbStore = RocksDbStore::open(temp_dir.path());
+        let journal = StoreJournal::new(storage.clone());
+        let mut scheduler = Scheduler::new(
+            ExecutionConfig::default().with_processor(PlainProcessor),
+            StorageConfig::default().with_store(storage.clone()),
+        );
+        commit_batch_with_receipt(&mut scheduler, block(1, 0));
+        commit_batch_with_receipt(&mut scheduler, block(2, 1));
+        commit_batch_with_receipt(&mut scheduler, block(3, 2));
+        journal.record(
+            3,
+            &JournalEntry {
+                end_index: 3,
+                from_block: block_hash(3),
+                block_prove_to: block_hash(3),
+                seq_commit: seq_commit(),
+            },
+        );
+        scheduler.shutdown();
+
+        // The restart half: every receipt resolves, so the rollback policy has nothing to do;
+        // the dead entry's aggregate receipt is stored where the re-feed would reload it.
+        let state = SchedulerState::<RocksDbStore, PlainProcessor>::new(
+            StorageConfig::default().with_store(storage.clone()),
+        );
+        assert_eq!(
+            rollback_uncoverable_gap(&state, &journal, &BATCH_IMAGE_ID),
+            None,
+            "every committed batch resolves; nothing to roll back",
+        );
+        state
+            .receipt_store()
+            .write_agg_receipt(
+                AggregatorKey {
+                    prefix: Prefix { checkpoint_index: 3.into() },
+                    block_hash: block_hash(3).as_bytes(),
+                    image_id: AGGREGATOR_IMAGE_ID,
+                    seq_commit: seq_commit().as_bytes(),
+                },
+                stale_settlement_journal(),
+            )
+            .wait_blocking();
+
+        let settlement_queue: AsyncQueue<ScheduledBundle<SettlementArtifact<Vec<u8>>>> =
+            AsyncQueue::new();
+        let (settlement_tx, settlement_rx) = watch::channel::<Option<SettlementInfo>>(None);
+        let prover = AggregateProver::new(
+            SyntheticBackend,
+            state.receipt_store(),
+            Some(journal.clone()),
+            AggregateProverConfig {
+                lane_key: Hash::default(),
+                covenant_id: None,
+                lane_source: ServeLaneProofs,
+                settlement_queue: Some(settlement_queue.clone()),
+                settlement: Some(settlement_rx),
+                bundle_size: 1..=1,
+                exits: None,
+            },
+        );
+
+        // The bridge's baseline tip proves through block 1 and carries the covenant's on-chain
+        // state, which the dead entry's receipt does not chain from.
+        settlement_tx.send_replace(Some(tip_through(1)));
+
+        // The dead entry is dropped and the range re-covered as one fresh bundle chaining from
+        // the tip: the emitted artifact carries the fresh compose's prev_state, not the stored
+        // dead receipt's. A republication re-feed of the fresh entry may follow it.
+        let mut prev_states = Vec::new();
+        loop {
+            let timeout = if prev_states.is_empty() {
+                Duration::from_secs(10)
+            } else {
+                Duration::from_millis(500)
+            };
+            let Some(bundle) = next_bundle(&settlement_queue, timeout) else { break };
+            bundle.wait_artifact_published_blocking();
+            let artifact =
+                bundle.artifact().expect("the re-covered bundle carries a real artifact");
+            assert_eq!(
+                bundle.block_prove_to(),
+                block_hash(3),
+                "the re-covered bundle spans the dead entry's whole range",
+            );
+            prev_states.push(artifact.prev_state);
+            assert!(prev_states.len() <= 2, "at most the compose and one republication re-feed");
+        }
+        assert_eq!(
+            prev_states.first(),
+            Some(&[0x00; 32]),
+            "the range is re-composed from the tip, not re-fed from the dead receipt",
+        );
+
+        let recorded: Vec<(u64, u64)> =
+            journal.entries().into_iter().map(|(s, e)| (s, e.end_index)).collect();
+        assert_eq!(recorded, vec![(2, 3)], "the re-covered entry replaces the dead one");
+
+        prover.shutdown();
+        state.storage().shutdown();
+    }
+}
+
+/// A lane source serving every fetch except one dead block: the block exists on chain but its
+/// lane proof is unobtainable (pruned lane history), the shape the live store served for the
+/// era's prove-through block.
+struct DeadBlockLaneProofs {
+    /// Block whose lane proof always fails.
+    dead: Hash,
+}
+
+impl LaneProofSource for DeadBlockLaneProofs {
+    async fn fetch_lane_proof(
+        &self,
+        req: LaneProofRequest,
+    ) -> Result<GetSeqCommitLaneProofResponse, LaneProofError> {
+        if req.block == self.dead {
+            Err(LaneProofError("dead block: lane history pruned".into()))
+        } else {
+            Ok(GetSeqCommitLaneProofResponse {
+                smt_proof: Vec::new(),
+                lane: None,
+                payload_and_ctx_digest: Hash::default(),
+                parent_seq_commit: Hash::default(),
+                inactivity_shortcut: Hash::default(),
+            })
+        }
+    }
+}
+
+/// Tests that a committed-gap range whose final block's lane proof is unobtainable still makes
+/// progress: the bundle's end walks down to the previous batch and covers the live prefix,
+/// instead of deferring the same dead-ended range on every wake. The still-dead suffix stays
+/// for a later pass, matching how live bundling parks on a dead final block.
+#[test]
+fn committed_gap_walks_end_down_over_a_dead_final_block() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    {
+        // The pre-restart half: block 1 settled and journaled, blocks 2 and 3 proved above it
+        // with no journal record (the kill preceded it). Block 3's lane proof is dead.
+        let storage: RocksDbStore = RocksDbStore::open(temp_dir.path());
+        let journal = StoreJournal::new(storage.clone());
+        let mut scheduler = Scheduler::new(
+            ExecutionConfig::default().with_processor(PlainProcessor),
+            StorageConfig::default().with_store(storage.clone()),
+        );
+        commit_batch_with_receipt(&mut scheduler, block(1, 0));
+        commit_batch_with_receipt(&mut scheduler, block(2, 1));
+        commit_batch_with_receipt(&mut scheduler, block(3, 2));
+        journal.record(
+            1,
+            &JournalEntry {
+                end_index: 1,
+                from_block: block_hash(1),
+                block_prove_to: block_hash(1),
+                seq_commit: seq_commit(),
+            },
+        );
+        scheduler.shutdown();
+
+        let state = SchedulerState::<RocksDbStore, PlainProcessor>::new(
+            StorageConfig::default().with_store(storage.clone()),
+        );
+        let settlement_queue: AsyncQueue<ScheduledBundle<SettlementArtifact<Vec<u8>>>> =
+            AsyncQueue::new();
+        let (settlement_tx, settlement_rx) = watch::channel::<Option<SettlementInfo>>(None);
+        let prover = AggregateProver::new(
+            SyntheticBackend,
+            state.receipt_store(),
+            Some(journal.clone()),
+            AggregateProverConfig {
+                lane_key: Hash::default(),
+                covenant_id: None,
+                lane_source: DeadBlockLaneProofs { dead: block_hash(3) },
+                settlement_queue: Some(settlement_queue.clone()),
+                settlement: Some(settlement_rx),
+                bundle_size: 1..=1,
+                exits: None,
+            },
+        );
+
+        settlement_tx.send_replace(Some(tip_through(1)));
+
+        // The pass walks the end down from the dead block 3 to the live block 2 and covers the
+        // prefix, recording its entry; no bundle ever proves through the dead block. A
+        // republication re-feed of the covered entry may follow the compose.
+        let mut proved_to = Vec::new();
+        loop {
+            let timeout = if proved_to.is_empty() {
+                Duration::from_secs(10)
+            } else {
+                Duration::from_millis(500)
+            };
+            let Some(bundle) = next_bundle(&settlement_queue, timeout) else { break };
+            bundle.wait_artifact_published_blocking();
+            assert!(bundle.artifact().is_some(), "the covered prefix carries a real artifact");
+            assert_eq!(
+                bundle.block_prove_to(),
+                block_hash(2),
+                "the end walks down over the dead final block to the previous batch",
+            );
+            proved_to.push(bundle.checkpoint_index());
+            assert!(proved_to.len() <= 2, "at most the compose and one republication re-feed");
+        }
+        assert_eq!(proved_to.first(), Some(&2), "the walk-down covered the live prefix");
+
+        let recorded: Vec<(u64, u64)> =
+            journal.entries().into_iter().map(|(s, e)| (s, e.end_index)).collect();
+        assert_eq!(
+            recorded,
+            vec![(2, 2)],
+            "the covered prefix is journaled; the dead suffix stays for a later pass",
+        );
+
+        prover.shutdown();
+        state.storage().shutdown();
+    }
 }
