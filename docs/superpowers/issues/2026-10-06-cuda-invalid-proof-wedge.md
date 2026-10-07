@@ -277,3 +277,32 @@ contradicts its metadata, the worker recording the boundary, the next startup's 
 below the range, and the re-feed settling ahead of new work. The test fixtures across the
 committed-gap suites now write metadata-consistent batch-transition receipts (chained lane
 tips), which is what the probe compares.
+
+## Postscript 5: the parked worker thread (2026-10-07 09:49 UTC)
+
+The marker-consuming restart (the fourth deploy) executed correctly: the rollback landed at
+2226447, the resume and gap re-form ran, the settler skipped and resolved the superseded
+bundles on chain, and the startup drain resolved the republished tip through the lane-tip
+fallback. Then the worker thread went silent for 40+ minutes while the rest of the node hummed:
+the bridge replayed and synced, the executor re-executed the reverted range and caught up to
+the live tip, and the batch prover ran a real GPU burst for the poisoned range. Ready receipts
+and newly scheduled batches produced no wake.
+
+Root cause: the worker was not parked, it was blocked. Its first bundle after the recovery
+waits on the front batch (a poisoned-range block, cache-missed, so nothing formed until the
+GPU burst published it ~10:10), then submits one aggregate prove. The risc0 client call has no
+timeout of its own, and that request was lost (the live shape matches a request issued while
+the CUDA server was still settling after process start: it is never answered and never errors,
+while every later request, including the batch burst, is served). The blocking prove call
+holds the worker thread forever; no inbox notification, artifact latch, or watch change can
+reach it. The wake primitives were audited and are sound (cancellation-token latches,
+notify_one queues), which is why nothing else on the node stalled.
+
+Fix: every prove attempt now runs on the blocking pool under a per-attempt timeout
+(`VPROGS_PROVE_TIMEOUT_SECS`, defaulting to 30 minutes, well above real prove durations).
+A timed-out attempt is abandoned (its thread lingers on the lost request) and retried like a
+failed one, so a lost request costs one timeout instead of the worker; exhaustion after the
+third attempt panics into the restart recovery as before. A unit test pins it: a prove call
+that never errors and never returns is retried once per attempt and the final panic names the
+attempts. The api crate's tokio dependency is host-gated, so the guest (no_std) build is
+unchanged.
