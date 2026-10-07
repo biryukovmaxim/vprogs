@@ -35,7 +35,10 @@ use vprogs_state_settlement_journal::{JournalEntry, StoreJournal};
 use vprogs_storage_manager::StorageConfig;
 use vprogs_storage_rocksdb_store::RocksDbStore;
 use vprogs_storage_types::Store;
-use vprogs_zk_abi::batch_aggregator::{StateTransition, StateTransitionArgs};
+use vprogs_zk_abi::{
+    batch_aggregator::{StateTransition, StateTransitionArgs},
+    batch_processor::{BatchTransition, BatchTransitionArgs},
+};
 use vprogs_zk_aggregate_prover::{
     AggregateProver, AggregateProverConfig, ScheduledBundle, SettlementArtifact,
 };
@@ -70,10 +73,34 @@ fn block(hash: u8, parent_id: u64) -> ChainBlockMetadata {
         hash: block_hash(hash),
         parent_id,
         seq_commit: seq_commit(),
-        prev_lane_tip: Hash::default(),
+        prev_lane_tip: block_hash(hash.saturating_sub(1)),
         lane_tip: block_hash(hash),
         ..Default::default()
     }
+}
+
+/// Encodes the per-batch receipt journal matching `meta`'s lane pins, with flat state pins so
+/// adjacent receipts chain.
+fn batch_receipt_from(meta: &ChainBlockMetadata) -> Vec<u8> {
+    let mut buf = Vec::new();
+    BatchTransition::encode(
+        &mut buf,
+        BatchTransitionArgs {
+            prev_state: &[0x11; 32],
+            prev_lane_tip: &meta.prev_lane_tip,
+            prev_lane_blue_score: 0,
+            new_state: &[0x11; 32],
+            new_lane_tip: &meta.lane_tip,
+            new_lane_blue_score: 0,
+            lane_key: &Hash::default(),
+            covenant_id: &[0u8; 32],
+            tx_image_id: &TX_IMAGE_ID,
+            deposit_spk_hash: &[0u8; 32],
+            lane_expired: false,
+            exits: b"",
+        },
+    );
+    buf
 }
 
 /// Encodes the settlement journal the synthetic aggregator receipt carries: a real (non-no-op)
@@ -318,7 +345,9 @@ fn unmapped_boundary_still_compacts_the_journal() {
 
         // The batch's receipt and artifact exist (a proof raced ahead of the reorg), so the
         // worker bundles and journals it although the scheduler never commits it.
-        gated.write_batch_receipt(settlement_journal()).wait_blocking();
+        gated
+            .write_batch_receipt(batch_receipt_from(gated.checkpoint().metadata()))
+            .wait_blocking();
         gated.publish_artifact(Some(settlement_journal()));
         prover.submit(&gated);
         let bundle = next_bundle(&settlement_queue, Duration::from_secs(10))
@@ -499,7 +528,9 @@ fn unmapped_boundary_drains_the_covered_prefix_by_lane_tip() {
 
         for batch in &batches[..3] {
             prover.submit(batch);
-            batch.write_batch_receipt(settlement_journal()).wait_blocking();
+            batch
+                .write_batch_receipt(batch_receipt_from(batch.checkpoint().metadata()))
+                .wait_blocking();
             batch.publish_artifact(Some(settlement_journal()));
         }
         wait_for_entries(&journal, 1);
@@ -558,7 +589,9 @@ fn unmapped_boundary_drains_the_covered_prefix_by_lane_tip() {
         // The queued work above the covered prefix still bundles once its pair completes: an
         // independent per-window drain would have consumed batches 3-4 as if they were covered.
         prover.submit(&batches[3]);
-        batches[3].write_batch_receipt(settlement_journal()).wait_blocking();
+        batches[3]
+            .write_batch_receipt(batch_receipt_from(batches[3].checkpoint().metadata()))
+            .wait_blocking();
         batches[3].publish_artifact(Some(settlement_journal()));
         let bundle = next_bundle(&settlement_queue, Duration::from_secs(10))
             .expect("the queued batches above the covered prefix must still bundle");
@@ -589,7 +622,9 @@ fn unmapped_boundary_drains_the_covered_prefix_by_lane_tip() {
         // The successor's arrival is what drains the residue: batch 5 chains off the settlement's
         // exit tip, so a settlement advance finds it and drops the covered prefix ahead of it.
         prover.submit(&batches[4]);
-        batches[4].write_batch_receipt(settlement_journal()).wait_blocking();
+        batches[4]
+            .write_batch_receipt(batch_receipt_from(batches[4].checkpoint().metadata()))
+            .wait_blocking();
         batches[4].publish_artifact(Some(settlement_journal()));
         settlement_tx.send_replace(Some(SettlementInfo {
             tx_id: TransactionId::from([0xae; 32]),

@@ -27,6 +27,11 @@ const PROVE_ATTEMPTS: u32 = 3;
 /// segments above), is logged, and is retried; after the final attempt the call panics, which
 /// the restart's executor rollback recovers from by re-executing and re-proving the range. The
 /// prove traits are infallible by contract, so a bad receipt is never returned or stored.
+///
+/// A guest assert is deterministic (a state or lineage contradiction in the inputs, not a
+/// prover fault), so it skips the retries entirely: the aggregate prover's host-side receipt
+/// probe and the startup rollback are the paths that act on it, and this panic is the last
+/// resort that keeps an invalid receipt from being composed.
 fn prove_with_retries<'a>(
     prover: &dyn Prover,
     elf: &[u8],
@@ -44,6 +49,11 @@ fn prove_with_retries<'a>(
             });
         match receipt {
             Ok(receipt) => return receipt,
+            Err(err) if err.contains("Guest panicked") => panic!(
+                "proving failed deterministically ({err}); a guest assert is a state or lineage \
+                 contradiction the prover cannot retry away, and the startup rollback \
+                 re-executes the range from the live chain"
+            ),
             Err(err) if attempt < PROVE_ATTEMPTS => {
                 log::warn!("proving attempt {attempt}/{PROVE_ATTEMPTS} failed ({err}); retrying");
             }

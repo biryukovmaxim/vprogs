@@ -127,6 +127,27 @@ impl<S: Store> StoreJournal<S> {
         StateMetadata::set_settled_boundary(&mut wb, index);
         self.store.commit(wb);
     }
+
+    /// Returns the lowest committed checkpoint a worker found unprovable in place, or `None`
+    /// when no such finding is recorded.
+    pub fn unprovable_boundary(&self) -> Option<u64> {
+        StateMetadata::unprovable_boundary(&self.store)
+    }
+
+    /// Records the unprovable boundary, committing it immediately so a kill right after the
+    /// finding cannot lose it.
+    pub fn record_unprovable_boundary(&self, index: u64) {
+        let mut wb = self.store.write_batch();
+        StateMetadata::set_unprovable_boundary(&mut wb, index);
+        self.store.commit(wb);
+    }
+
+    /// Clears the unprovable boundary (the recovery consumed the finding).
+    pub fn clear_unprovable_boundary(&self) {
+        let mut wb = self.store.write_batch();
+        StateMetadata::delete_unprovable_boundary(&mut wb);
+        self.store.commit(wb);
+    }
 }
 
 #[cfg(test)]

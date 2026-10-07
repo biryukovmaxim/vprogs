@@ -27,7 +27,10 @@ use vprogs_state_proof_receipt::{AggregatorKey, Prefix};
 use vprogs_state_settlement_journal::{JournalEntry, StoreJournal};
 use vprogs_storage_manager::StorageConfig;
 use vprogs_storage_rocksdb_store::RocksDbStore;
-use vprogs_zk_abi::batch_aggregator::{StateTransition, StateTransitionArgs};
+use vprogs_zk_abi::{
+    batch_aggregator::{StateTransition, StateTransitionArgs},
+    batch_processor::{BatchTransition, BatchTransitionArgs},
+};
 use vprogs_zk_aggregate_prover::{
     AggregateProver, AggregateProverConfig, ScheduledBundle, SettlementArtifact,
     rollback_uncoverable_gap,
@@ -183,10 +186,41 @@ fn block(hash: u8, parent_id: u64) -> ChainBlockMetadata {
         hash: Hash::from_bytes([hash; 32]),
         parent_id,
         seq_commit: seq_commit(),
-        prev_lane_tip: Hash::default(),
+        prev_lane_tip: Hash::from_bytes([hash.saturating_sub(1); 32]),
         lane_tip: Hash::from_bytes([hash; 32]),
         ..Default::default()
     }
+}
+
+/// Encodes the per-batch receipt journal for the block built from `hash`: the lane pins match
+/// the block metadata ([`block`] chains each block's lane tip onto the previous block's) and
+/// the state pins are flat, so adjacent receipts chain. `new_lane_tip` overrides the exit pin
+/// for the poisoned-receipt shape.
+fn batch_receipt_journal(hash: u8, new_lane_tip: [u8; 32]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    BatchTransition::encode(
+        &mut buf,
+        BatchTransitionArgs {
+            prev_state: &[0x11; 32],
+            prev_lane_tip: &Hash::from_bytes([hash.saturating_sub(1); 32]),
+            prev_lane_blue_score: 0,
+            new_state: &[0x11; 32],
+            new_lane_tip: &Hash::from_bytes(new_lane_tip),
+            new_lane_blue_score: 0,
+            lane_key: &Hash::default(),
+            covenant_id: &[0u8; 32],
+            tx_image_id: &TX_IMAGE_ID,
+            deposit_spk_hash: &[0u8; 32],
+            lane_expired: false,
+            exits: b"",
+        },
+    );
+    buf
+}
+
+/// The valid per-batch receipt for the block built from `hash`.
+fn batch_receipt(hash: u8) -> Vec<u8> {
+    batch_receipt_journal(hash, [hash; 32])
 }
 
 /// One lane transaction: enough for the batch to be non-empty, so its bundle composes a receipt
@@ -221,7 +255,7 @@ fn commit_batch_with_receipt(
 ) -> vprogs_scheduling_scheduler::ScheduledBatch<RocksDbStore, PlainProcessor> {
     let batch = scheduler.schedule(meta, vec![lane_tx()]);
     batch.wait_committed_blocking();
-    batch.write_batch_receipt(settlement_journal()).wait_blocking();
+    batch.write_batch_receipt(batch_receipt(meta.hash.as_bytes()[0])).wait_blocking();
     batch
 }
 
@@ -780,5 +814,104 @@ fn committed_gap_walks_end_down_over_a_dead_final_block() {
 
         prover.shutdown();
         state.storage().shutdown();
+    }
+}
+
+/// Tests that a cached receipt which is present but poisoned (its proven lane pins contradict
+/// the persisted batch metadata, the host-side shape of a receipt from a lineage the live
+/// chain no longer matches) counts as a miss, not a hit: the committed-gap pass records the
+/// unprovable boundary, and the next startup's rollback rolls the executor below the poisoned
+/// range so the bridge re-feed re-executes it with fresh, consistent receipts. Composing the
+/// poisoned receipts instead hits the guest's deterministic resource-hash assert and kills the
+/// proving thread.
+#[test]
+fn committed_gap_with_poisoned_receipt_rolls_back() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    {
+        // The pre-restart half: block 1 settled and journaled, block 2 committed with a
+        // well-encoded receipt whose exit lane tip contradicts its metadata, block 3 proved.
+        let storage: RocksDbStore = RocksDbStore::open(temp_dir.path());
+        let journal = StoreJournal::new(storage.clone());
+        let mut scheduler = Scheduler::new(
+            ExecutionConfig::default().with_processor(PlainProcessor),
+            StorageConfig::default().with_store(storage.clone()),
+        );
+        commit_batch_with_receipt(&mut scheduler, block(1, 0));
+        let poisoned = scheduler.schedule(block(2, 1), vec![lane_tx()]);
+        poisoned.wait_committed_blocking();
+        poisoned.write_batch_receipt(batch_receipt_journal(2, [0xEE; 32])).wait_blocking();
+        commit_batch_with_receipt(&mut scheduler, block(3, 2));
+        journal.record(
+            1,
+            &JournalEntry {
+                end_index: 1,
+                from_block: block_hash(1),
+                block_prove_to: block_hash(1),
+                seq_commit: seq_commit(),
+            },
+        );
+        scheduler.shutdown();
+
+        // The first run: the presence-only policy has nothing to do, and the worker's gap pass
+        // probes the receipt's pins, finds the contradiction, and records the unprovable
+        // boundary for the next startup.
+        let state = SchedulerState::<RocksDbStore, PlainProcessor>::new(
+            StorageConfig::default().with_store(storage.clone()),
+        );
+        assert_eq!(
+            rollback_uncoverable_gap(&state, &journal, &BATCH_IMAGE_ID),
+            None,
+            "the poisoned receipt is present, so the presence probe alone cannot see it",
+        );
+        let settlement_queue: AsyncQueue<ScheduledBundle<SettlementArtifact<Vec<u8>>>> =
+            AsyncQueue::new();
+        let (settlement_tx, settlement_rx) = watch::channel::<Option<SettlementInfo>>(None);
+        let prover = AggregateProver::new(
+            SyntheticBackend,
+            state.receipt_store(),
+            Some(journal.clone()),
+            AggregateProverConfig {
+                lane_key: Hash::default(),
+                covenant_id: None,
+                lane_source: ServeLaneProofs,
+                settlement_queue: Some(settlement_queue),
+                settlement: Some(settlement_rx),
+                bundle_size: 1..=1,
+                exits: None,
+            },
+        );
+        settlement_tx.send_replace(Some(tip_through(1)));
+        wait_until("the gap pass records the unprovable boundary", Duration::from_secs(10), || {
+            journal.unprovable_boundary() == Some(2)
+        });
+        prover.shutdown();
+        state.storage().shutdown();
+
+        // The next startup consumes the finding: the rollback lands below the poisoned range,
+        // reverts its metadata, and clears the marker.
+        let state = SchedulerState::<RocksDbStore, PlainProcessor>::new(
+            StorageConfig::default().with_store(storage.clone()),
+        );
+        assert_eq!(
+            rollback_uncoverable_gap(&state, &journal, &BATCH_IMAGE_ID),
+            Some(1),
+            "the recorded unprovable boundary rolls the executor below the poisoned range",
+        );
+        assert_eq!(
+            journal.committed_tip().map(|(index, _)| index),
+            Some(1),
+            "the poisoned range's metadata rows are reverted with the rollback",
+        );
+        assert_eq!(journal.unprovable_boundary(), None, "the consumed finding is cleared");
+
+        // The re-feed re-executes the range with fresh, consistent receipts and settles ahead
+        // of new work, exactly as the lost-receipt recovery does.
+        restart_refeed_and_settle(
+            &state,
+            &journal,
+            ("the resume pass drops the settled tail entry", || {
+                !journal.entries().iter().any(|(start, _)| *start == 1)
+            }),
+        );
     }
 }

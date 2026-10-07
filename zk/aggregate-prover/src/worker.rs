@@ -19,9 +19,12 @@ use vprogs_scheduling_scheduler::{
 use vprogs_state_proof_receipt::{AggregatorKey, BatchKey, Prefix};
 use vprogs_state_settlement_journal::{JournalEntry, StoreJournal};
 use vprogs_storage_types::{StateSpace, Store};
-use vprogs_zk_abi::batch_aggregator::{Inputs as AggregatorInputs, StateTransition};
+use vprogs_zk_abi::{
+    batch_aggregator::{Inputs as AggregatorInputs, StateTransition},
+    batch_processor::BatchTransition,
+};
 use vprogs_zk_batch_prover::{LaneProofRequest, LaneProofSource};
-use zerocopy::IntoBytes;
+use zerocopy::{FromBytes, IntoBytes};
 
 use crate::{
     AggregateProver, AggregateProverConfig, Backend, BundleBlocks, ExitsForBundle, ScheduledBundle,
@@ -106,8 +109,21 @@ pub fn rollback_uncoverable_gap<S: Store, P: Processor<S>>(
     let floor = settled.unwrap_or(0).max(state.root().index());
     let (committed_tip, _) = journal.committed_tip()?;
     if committed_tip <= floor {
+        // A recorded finding below the floor was overtaken by events (the range settled or
+        // compacted past it); retire it rather than leaving it set forever.
+        if journal.unprovable_boundary().is_some_and(|boundary| boundary <= floor) {
+            journal.clear_unprovable_boundary();
+        }
         return None;
     }
+    // A boundary the worker found unprovable in place (a cached receipt contradicting the
+    // persisted chain, or a range whose every final block has an unobtainable lane proof while
+    // the node serves the settled tip) is a guaranteed miss at its index: the presence probe
+    // below cannot see it, because the poisoned receipts are present. Cap the walk below it.
+    let unprovable = journal
+        .unprovable_boundary()
+        .filter(|boundary| *boundary > floor && *boundary <= committed_tip);
+    let walk_end = unprovable.map_or(committed_tip, |boundary| boundary - 1);
     // The first batch above the boundary whose cached receipt cannot be resolved bounds the
     // uncoverable range. The same non-empty heuristic the committed-gap pass applies (an empty
     // batch composes no receipt) keeps empty batches coverable as-is, and a metadata hole is
@@ -117,7 +133,7 @@ pub fn rollback_uncoverable_gap<S: Store, P: Processor<S>>(
     // worker a receipt handle would need to await.
     let mut boundary = None;
     let mut last_present = floor;
-    for index in floor + 1..=committed_tip {
+    for index in floor + 1..=walk_end {
         let Some(metadata) = journal.batch_metadata(index) else {
             continue;
         };
@@ -136,21 +152,28 @@ pub fn rollback_uncoverable_gap<S: Store, P: Processor<S>>(
         }
         last_present = index;
     }
+    // The recorded finding stands even when the walk below it found nothing else.
+    if unprovable.is_some() && boundary.is_none() {
+        boundary = Some(last_present);
+    }
     let target = boundary?;
     match rollback_persisted_to(state, target) {
         Ok(_) => {
             // Entries above the target chain across the now-reverted range; the re-feed and
-            // re-prove re-record them from the recovered state.
+            // re-prove re-record them from the recovered state. The consumed finding goes with
+            // them.
             let stale = entries.iter().filter(|(_, entry)| entry.end_index > target).count();
             for (start, entry) in &entries {
                 if entry.end_index > target {
                     journal.delete(*start);
                 }
             }
+            journal.clear_unprovable_boundary();
             log::warn!(
                 "aggregate-prover: committed batches above checkpoint {target} lack resolvable \
-                 receipts; rolled the executor back to it and dropped {stale} journal entries \
-                 above it so the bridge re-feed re-executes and re-proves the range"
+                 or trustworthy receipts; rolled the executor back to it and dropped {stale} \
+                 journal entries above it so the bridge re-feed re-executes and re-proves the \
+                 range"
             );
             Some(target)
         }
@@ -1089,11 +1112,15 @@ where
             return GapOutcome::Nothing;
         };
         // The bundle covers the contiguously-durable prefix: an empty batch is durable as-is,
-        // and the first non-empty batch without metadata or a receipt bounds the range. The
-        // covered non-empty batches carry their own metadata, from which each candidate end
-        // derives its fields.
+        // and the first non-empty batch without metadata, without a receipt, or with a receipt
+        // whose proven pins contradict the persisted state bounds the range. The covered
+        // non-empty batches carry their own metadata, from which each candidate end derives
+        // its fields.
         let mut covered: Vec<(u64, ChainBlockMetadata, B::Receipt)> = Vec::new();
         let mut miss = None;
+        let mut poisoned_at = None;
+        // Exit pins (state, lane tip) of the last covered receipt, for the contiguity check.
+        let mut prev_exit: Option<([u8; 32], Hash)> = None;
         for index in first..=committed_tip {
             let Some(metadata) = journal.batch_metadata(index) else {
                 miss = Some(index);
@@ -1111,6 +1138,30 @@ where
                     miss = Some(index);
                     break;
                 };
+                // A cached receipt is only coverable when its proven transition agrees with the
+                // persisted chain: its lane pins must match the batch metadata, and its entry
+                // pins must continue the previous receipt's exit pins (the host-side cousin of
+                // the guest's per-resource hash assert, which fires deterministically on
+                // receipts from a lineage the live chain no longer matches). A receipt that
+                // does not decode as a batch transition is left to the guest's own check.
+                let journal_bytes = B::journal_bytes(&receipt);
+                let decoded = BatchTransition::ref_from_bytes(&journal_bytes).ok();
+                let valid = decoded.is_none_or(|t| {
+                    let pins_match = t.new_lane_tip == metadata.lane_tip
+                        && t.prev_lane_tip == metadata.prev_lane_tip;
+                    let chains = prev_exit.is_none_or(|(state, lane)| {
+                        state == t.prev_state && lane == t.prev_lane_tip
+                    });
+                    pins_match && chains
+                });
+                if !valid {
+                    miss = Some(index);
+                    poisoned_at = Some(index);
+                    break;
+                }
+                if let Some(t) = decoded {
+                    prev_exit = Some((t.new_state, t.new_lane_tip));
+                }
                 covered.push((index, metadata, receipt));
             }
         }
@@ -1126,6 +1177,17 @@ where
                  uncovered. The startup rollback \
                  (rollback_uncoverable_gap) re-executes such a range, so a miss here means it \
                  could not run or this raced a batch whose prove has not landed yet"
+            );
+        }
+        // A receipt whose pins contradict the persisted state is unprovable in place (the
+        // compose would hit the guest's deterministic assert): record the finding so the next
+        // startup's rollback re-executes the range from the live chain.
+        if let Some(index) = poisoned_at {
+            journal.record_unprovable_boundary(index);
+            log::warn!(
+                "aggregate-prover: committed batch {index}'s cached receipt contradicts the \
+                 persisted chain (mismatched lane or entry pins); recorded it as the unprovable \
+                 boundary for the next startup's rollback"
             );
         }
         // No real work below the miss: nothing to compose, matching the live no-op path.
@@ -1160,11 +1222,39 @@ where
             }
         }
         let Some((covered_end, end_metadata, receipt)) = proven else {
-            log::warn!(
-                "aggregate-prover: committed-gap range {first}..={committed_tip} has no live \
-                 final block (every lane-proof fetch failed; dead blocks or a stalled node); \
-                 deferring the range to the next wake"
-            );
+            // Every candidate end's lane proof failed. Distinguish a dead range from a stalled
+            // node by probing the lane source for the settlement watch's own block: the bridge
+            // observed that block on the live chain, so a reachable tip means the node serves
+            // lane proofs and the range's blocks are genuinely dead (pruned lane history, a
+            // lineage the live chain no longer matches) and unprovable in place. Record the
+            // finding so the next startup's rollback re-executes the range from the live
+            // chain; an unreachable tip defers as before (the stall may clear).
+            let node_live = match tip {
+                Some(tip) => self
+                    .lane_source
+                    .fetch_lane_proof(LaneProofRequest {
+                        block: tip.block_prove_to,
+                        lane_key: self.lane_key,
+                    })
+                    .await
+                    .is_ok(),
+                None => false,
+            };
+            if node_live {
+                journal.record_unprovable_boundary(first);
+                log::warn!(
+                    "aggregate-prover: committed-gap range {first}..={committed_tip} has no live \
+                     final block while the settled tip's lane proof fetches (dead blocks from a \
+                     lineage the live chain no longer matches); recorded {first} as the \
+                     unprovable boundary for the next startup's rollback, deferring"
+                );
+            } else {
+                log::warn!(
+                    "aggregate-prover: committed-gap range {first}..={committed_tip} has no live \
+                     final block (every lane-proof fetch failed; dead blocks or a stalled node); \
+                     deferring the range to the next wake"
+                );
+            }
             return GapOutcome::Deferred(committed_tip);
         };
         let entry = JournalEntry {
@@ -1179,6 +1269,15 @@ where
             "aggregate-prover: re-formed committed gap {first}..={covered_end} onto the \
              settlement queue"
         );
+        // A partial cover (the walk-down skipped dead blocks above the proven end) strands the
+        // remainder between this bundle and any new work, which would chain from the executor
+        // state past it and mismatch the covenant: defer the remainder so the next wake re-runs
+        // the pass against whatever the chain looks like then (new live commits extend the
+        // range and one bundle takes the dead interior; nothing new arriving leaves it to the
+        // unprovable-boundary path above).
+        if covered_end < committed_tip {
+            return GapOutcome::Deferred(committed_tip);
+        }
         GapOutcome::Covered(covered_end)
     }
 

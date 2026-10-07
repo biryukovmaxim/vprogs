@@ -30,7 +30,10 @@ use vprogs_scheduling_scheduler::{ExecutionConfig, Scheduler, TransactionContext
 use vprogs_state_settlement_journal::StoreJournal;
 use vprogs_storage_manager::StorageConfig;
 use vprogs_storage_rocksdb_store::RocksDbStore;
-use vprogs_zk_abi::batch_aggregator::{StateTransition, StateTransitionArgs};
+use vprogs_zk_abi::{
+    batch_aggregator::{StateTransition, StateTransitionArgs},
+    batch_processor::{BatchTransition, BatchTransitionArgs},
+};
 use vprogs_zk_aggregate_prover::{
     AggregateProver, AggregateProverConfig, ScheduledBundle, SettlementArtifact,
 };
@@ -61,10 +64,34 @@ fn block(hash: u8, parent_id: u64) -> ChainBlockMetadata {
         hash: block_hash(hash),
         parent_id,
         seq_commit: seq_commit(),
-        prev_lane_tip: Hash::default(),
+        prev_lane_tip: block_hash(hash.saturating_sub(1)),
         lane_tip: block_hash(hash),
         ..Default::default()
     }
+}
+
+/// Encodes the per-batch receipt journal matching `meta`'s lane pins, with flat state pins so
+/// adjacent receipts chain.
+fn batch_receipt_from(meta: &ChainBlockMetadata) -> Vec<u8> {
+    let mut buf = Vec::new();
+    BatchTransition::encode(
+        &mut buf,
+        BatchTransitionArgs {
+            prev_state: &[0x11; 32],
+            prev_lane_tip: &meta.prev_lane_tip,
+            prev_lane_blue_score: 0,
+            new_state: &[0x11; 32],
+            new_lane_tip: &meta.lane_tip,
+            new_lane_blue_score: 0,
+            lane_key: &Hash::default(),
+            covenant_id: &[0u8; 32],
+            tx_image_id: &TX_IMAGE_ID,
+            deposit_spk_hash: &[0u8; 32],
+            lane_expired: false,
+            exits: b"",
+        },
+    );
+    buf
 }
 
 /// Encodes the settlement journal the synthetic aggregator receipt carries: a real (non-no-op)
@@ -265,7 +292,9 @@ fn harness(blocks: &[(u8, u64)]) -> Harness {
     for &(hash, parent) in blocks {
         let batch = scheduler.schedule(block(hash, parent), vec![lane_tx()]);
         batch.wait_committed_blocking();
-        batch.write_batch_receipt(settlement_journal()).wait_blocking();
+        batch
+            .write_batch_receipt(batch_receipt_from(batch.checkpoint().metadata()))
+            .wait_blocking();
         batch.publish_artifact(Some(settlement_journal()));
         prover.submit(&batch);
         let bundle = next_bundle(&queue, Duration::from_secs(10)).expect("the batch must bundle");

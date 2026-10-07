@@ -9,6 +9,9 @@ mod keys {
     pub const LAST_COMMITTED: &[u8] = b"last_committed";
     /// Key for the settled boundary (highest checkpoint whose bundle has settled; bare index).
     pub const SETTLED_BOUNDARY: &[u8] = b"settled_boundary";
+    /// Key for the unprovable boundary (lowest committed checkpoint a worker found unprovable in
+    /// place; bare index).
+    pub const UNPROVABLE_BOUNDARY: &[u8] = b"unprovable_boundary";
 }
 
 /// Provides type-safe operations for the Metadata column family.
@@ -93,5 +96,40 @@ impl StateMetadata {
             keys::SETTLED_BOUNDARY,
             &borsh::to_vec(&index).expect("failed to serialize boundary index"),
         );
+    }
+
+    /// Returns the lowest committed checkpoint a worker found unprovable in place (a receipt
+    /// whose proven pins contradict the persisted metadata, or a range whose every final block
+    /// has an unobtainable lane proof), or `None` when no such finding is recorded.
+    ///
+    /// The startup recovery's rollback consumes and clears it: the range above it re-executes
+    /// from the live chain instead of composing the poisoned receipts.
+    pub fn unprovable_boundary<S>(store: &S) -> Option<u64>
+    where
+        S: ReadStore,
+    {
+        store
+            .get(StateSpace::Metadata, keys::UNPROVABLE_BOUNDARY)
+            .map(|bytes| borsh::from_slice(&bytes).expect("corrupted store: unrecoverable"))
+    }
+
+    /// Sets the unprovable boundary.
+    pub fn set_unprovable_boundary<W>(wb: &mut W, index: u64)
+    where
+        W: WriteBatch,
+    {
+        wb.put(
+            StateSpace::Metadata,
+            keys::UNPROVABLE_BOUNDARY,
+            &borsh::to_vec(&index).expect("failed to serialize boundary index"),
+        );
+    }
+
+    /// Deletes the unprovable boundary.
+    pub fn delete_unprovable_boundary<W>(wb: &mut W)
+    where
+        W: WriteBatch,
+    {
+        wb.delete(StateSpace::Metadata, keys::UNPROVABLE_BOUNDARY);
     }
 }
