@@ -306,3 +306,28 @@ third attempt panics into the restart recovery as before. A unit test pins it: a
 that never errors and never returns is retried once per attempt and the final panic names the
 attempts. The api crate's tokio dependency is host-gated, so the guest (no_std) build is
 unchanged.
+
+## Postscript 6: receipts surviving the rollback (2026-10-07 11:25 UTC)
+
+The fifth deploy executed the whole recovery as designed (rollback at 2242446, bridge replay,
+re-execution underway), and then the re-cover's compose hit the guest's resource-hash assert
+again, this time on a receipt the host probe had passed: the deterministic classifier fired
+immediately with no retries, killing the proving thread cleanly. Root cause: the rollback
+deleted the metadata rows and journal entries above the target but left the cached receipts.
+Receipt keys are checkpoint index + block hash + image id, so a block whose hash repeats
+between the reverted lineage and the live re-execution hits the stale key, and the re-cover
+reuses a receipt proved under the reverted lineage's per-resource assumptions. The iteration-5
+host probe validates lane pins and the state splice, exactly the dimensions it can see; the
+per-resource hashes the guest additionally checks were never probed host-side (the seam the
+iteration-5 report flagged).
+
+Fix: rollback_persisted_to now invalidates every cached receipt above the target, using the
+pruning worker's own checkpoint-granular invalidate_checkpoint (one prefix scan per checkpoint
+index; batch, transaction, and aggregate receipts share the index prefix, so all three die
+together). The re-covered range then proves fresh from the live-derived batches, which cannot
+disagree with themselves. The cost is GPU work per rollback (no cache hits above the
+boundary), which is the accepted trade against mirroring the guest verifier host-side.
+
+The deterministic-panic path stays: converting it into a marker-record-and-continue would
+mean threading an error through the infallible prove trait across three crates, and with
+receipts invalidated at the rollback this recurrence has no path back.
