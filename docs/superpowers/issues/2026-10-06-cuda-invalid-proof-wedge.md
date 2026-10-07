@@ -232,3 +232,48 @@ Fixes:
   ends as this dead-settlement conflict and is now cleaned by the resume drop above. Two tests
   pin the pair: the dead-chaining entry is dropped and its range re-covered from the tip, and
   the dead final block walks the end down to the live prefix.
+
+## Postscript 4: receipts present but poisoned (2026-10-07 09:04 UTC)
+
+The third deploy ran the new paths, then the gap re-cover's compose hit a deterministic guest
+assert twice ("resource hash mismatch": the batch verifier's per-resource check in
+zk/abi/src/batch_processor/verifier.rs) and the third attempt's panic killed the proving
+thread. Simultaneously the walk-down correctly found no live end: the range carried persisted
+metadata and cached receipts from a lineage the live chain no longer matches (its blocks' lane
+proofs are unobtainable), so the receipts are present but poison. The presence-only probe
+passed, the compose ran, and only the guest assert plus the panic stood between the poisoned
+range and a bad settlement. The same wedge class as the original incident, generalized from
+receipt-absent to receipt-invalid.
+
+Fixes:
+
+- The committed-gap pass now probes each cached receipt's proven pins host-side: the receipt's
+  batch transition must carry the batch metadata's lane tips, and each receipt's entry pins
+  must continue the previous receipt's exit pins (the host-side cousin of the guest's
+  per-resource hash assert; a receipt that does not decode as a batch transition is left to
+  the guest's own check). A contradiction counts as a miss and is recorded as a durable
+  unprovable boundary (a StateMetadata key), which the next startup's rollback consumes:
+  the walk treats the recorded index as a guaranteed miss, rolls the executor below it,
+  drops the stale metadata rows and journal entries, and clears the finding.
+- The walk-down's exhaustion path records the same unprovable boundary when the node is
+  demonstrably healthy: it probes the lane source for the settlement tip's own block (the
+  bridge observed it on the live chain), so a reachable tip with an all-dead range means dead
+  blocks, not a stalled node. An unreachable tip keeps the plain deferral. A partial cover
+  (the walk-down proved through a lower end) now defers its remainder instead of abandoning
+  it, so nothing strands between the covered bundle and new work.
+- The prove retries classify deterministic failures: a guest assert skips the retry loop
+  entirely and panics immediately naming the class (the host-side probe and the startup
+  rollback are the paths that act on it; the panic stays the last resort that keeps an
+  invalid receipt from being composed).
+- The policy cannot do the receipt decode itself (it has no backend bound, so no
+  journal-bytes projection), which is why the finding flows through the durable marker
+  instead: the worker (which holds the backend) validates, the startup policy (which holds
+  the rollback) acts. Recovery is therefore two-phase on a poisoned store: the run that
+  discovers the contradiction records it, the next restart rolls back below it and re-executes
+  the range from the live chain.
+
+The poisoned-receipt test pins the whole loop: a well-encoded receipt whose exit lane tip
+contradicts its metadata, the worker recording the boundary, the next startup's rollback
+below the range, and the re-feed settling ahead of new work. The test fixtures across the
+committed-gap suites now write metadata-consistent batch-transition receipts (chained lane
+tips), which is what the probe compares.
