@@ -194,3 +194,41 @@ Three corrections:
 A third test pins the exact shape: entries journalled above an interior receipt gap, a settled
 boundary recorded at that tail, restart, floor from the root, boundary at the gap, stale
 entries dropped, recovered range and new work settling in order.
+
+## Postscript 3: the dead-settlement entry and the dead final block (2026-10-07 02:08 UTC)
+
+The stack ran green for 14 h after the second fix (83 settlements overnight), then froze. A
+funding race double-spend killed one settlement: two settlements built seconds apart funded
+their fees from the same UTXOs, the later one could never land, and the settler correctly
+recognized the conflict ("covenant outpoint spent by another settlement"). The freeze itself
+came from what the dead settlement left behind.
+
+- The wedge: journal entries whose bundles chain from a base the covenant never took (the dead
+  settlement's end state, not the on-chain tip). The settler skips each re-fed bundle as a
+  base mismatch, but the skip's resolution cannot delete them: it verifies the CURRENT tip's
+  outpoint, which the live continuation holds unspent, correctly. Nothing else ever removed
+  the entries, so every wake re-folded from the same stale base and the journal grew an entry
+  per skipped bundle.
+- The restart failure: the resume pass cannot map the tip's boundary into the entries' span
+  (it sits below them) and re-fed the tail unchanged; and the committed-gap re-form, pinned by
+  its deferral bound to the era's committed tip, deferred forever on that block's unobtainable
+  lane proof (the block exists on chain but its lane history is pruned).
+
+Fixes:
+
+- The resume pass now tells the no-mapping case apart by the first entry's own receipt: an
+  entry chains from the tip iff its proven transition starts at the tip's state and lane tip.
+  Chaining entries re-feed as before (the normal pending tail); dead ones are dropped, and the
+  committed-gap pass re-covers their range as one bundle chaining from the tip. An entry whose
+  receipt cannot be reloaded counts as dead, matching the re-feed's own drop.
+- The committed-gap bundle's end now walks down over dead final blocks: each failed end
+  retries through the previous non-empty batch until one proves, so the pass makes progress
+  instead of deferring the same dead-ended range every wake. The still-dead suffix stays for a
+  later pass (exactly how live bundling parks on a dead final block), and the journal tail
+  advancing past each covered prefix compounds the progress.
+- The funding race itself is not separately serialized: the settler's existing fee-rejected
+  loop already re-funds from another UTXO when the node names the spent input. The residual
+  window is both colliding submissions accepted into the mempool before either confirms, which
+  ends as this dead-settlement conflict and is now cleaned by the resume drop above. Two tests
+  pin the pair: the dead-chaining entry is dropped and its range re-covered from the tip, and
+  the dead final block walks the end down to the live prefix.
